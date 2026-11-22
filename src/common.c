@@ -3,6 +3,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 static _Thread_local char last_error[512];
 
@@ -17,6 +19,17 @@ bowser_result_e bw_fail(bowser_result_e code, const char *fmt, ...) {
 uint32_t bowser_abi_version(void) { return BOWSER_ABI_VERSION; }
 const char *bowser_last_error(void) { return last_error; }
 void bowser_string_free(char *s) { free(s); }
+
+bool bw_copy_config(void *dst, size_t dst_size, const void *src, size_t min_size) {
+  size_t size;
+  memcpy(&size, src, sizeof size); // every config struct starts with its size
+  if (size < min_size) return false;
+  memset(dst, 0, dst_size);
+  memcpy(dst, src, size < dst_size ? size : dst_size);
+  return true;
+}
+
+uint64_t bw_now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
 void bw_put_size(bw_buf *b, bowser_size_s s) {
   bw_put_f64(b, s.width);

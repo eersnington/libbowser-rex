@@ -3,7 +3,7 @@ CFLAGS := -Wall -Wextra -Wno-unused-parameter -O2 -g -Iinclude
 OBJCFLAGS := $(CFLAGS) -fobjc-arc
 FRAMEWORKS := -framework Foundation -framework QuartzCore -framework IOSurface
 
-LIB_SRC := src/common.c src/wire.c src/frames.c src/producer.m src/host.m
+LIB_SRC := src/common.c src/wire.c src/frames.c src/link.m src/producer.m src/host.m
 LIB_OBJ := $(patsubst src/%,$(BUILD)/obj/%.o,$(LIB_SRC))
 
 all: $(BUILD)/libbowser.a $(BUILD)/bowser-test $(BUILD)/bowser-host

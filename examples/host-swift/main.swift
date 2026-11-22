@@ -35,6 +35,9 @@ final class SurfaceView: NSView, NSTextInputClient {
     bowser_host_resize(host, bowser_size_s(width: bounds.width, height: bounds.height, scale: scale))
   }
 
+  // NSEvent.timestamp and bowser timestamps share a clock: CLOCK_UPTIME_RAW.
+  func nanos(_ event: NSEvent) -> UInt64 { UInt64(event.timestamp * 1e9) }
+
   // AppKit views have a bottom-left origin; bowser uses top-left.
   func point(_ event: NSEvent) -> NSPoint {
     let p = convert(event.locationInWindow, from: nil)
@@ -47,7 +50,7 @@ final class SurfaceView: NSView, NSTextInputClient {
     let clicks = Int32(event.type == .mouseMoved ? 0 : event.clickCount)
     var m = bowser_mouse_s(
       action: action, button: button, x: p.x, y: p.y, click_count: clicks,
-      mods: UInt64(event.modifierFlags.rawValue))
+      mods: UInt64(event.modifierFlags.rawValue), timestamp_ns: nanos(event))
     bowser_host_mouse(host, &m)
   }
 
@@ -71,7 +74,7 @@ final class SurfaceView: NSView, NSTextInputClient {
     var s = bowser_scroll_s(
       dx: e.scrollingDeltaX, dy: e.scrollingDeltaY, precise: e.hasPreciseScrollingDeltas,
       phase: Int32(e.phase.rawValue), momentum_phase: Int32(e.momentumPhase.rawValue),
-      x: p.x, y: p.y, mods: UInt64(e.modifierFlags.rawValue))
+      x: p.x, y: p.y, mods: UInt64(e.modifierFlags.rawValue), timestamp_ns: nanos(e))
     bowser_host_scroll(host, &s)
   }
 
@@ -83,7 +86,7 @@ final class SurfaceView: NSView, NSTextInputClient {
       unmodified.withCString { u in
         var k = bowser_key_s(
           action: action, keycode: e.keyCode, mods: UInt64(e.modifierFlags.rawValue),
-          text: t, unmodified_text: u)
+          text: t, unmodified_text: u, timestamp_ns: nanos(e))
         bowser_host_key(host, &k)
       }
     }

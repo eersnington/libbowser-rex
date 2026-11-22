@@ -7,6 +7,13 @@
 // Set the calling thread's error message and return code.
 bowser_result_e bw_fail(bowser_result_e code, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
+// Copy a caller's config struct into dst (dst_size bytes), zero-filling the
+// fields a smaller, older struct lacks. False if it's below min_size.
+bool bw_copy_config(void *dst, size_t dst_size, const void *src, size_t min_size);
+
+// CLOCK_UPTIME_RAW nanoseconds, the input timestamp clock.
+uint64_t bw_now_ns(void);
+
 // Encode and decode the structs that cross the wire.
 void bw_put_size(bw_buf *, bowser_size_s);
 bowser_size_s bw_get_size(bw_rd *);

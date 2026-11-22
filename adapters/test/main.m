@@ -6,15 +6,20 @@
 // - Clicks leave dots; scrolling moves a striped column.
 //
 // Usage: bowser-test [--transport calayerhost|iosurface] [--tickets N]
-//                    [--surfaces N] [--echo]
+//                    [--surfaces N] [--echo] [--spawn]
 // Prints N tickets per surface, one per line, surface by surface, then runs
-// until killed. --surfaces adds scene-less surfaces; --echo prints events.
+// until killed. --surfaces adds scene-less surfaces; --echo prints events;
+// --spawn starts `sleep 5` on each attach, like an engine starting a helper.
 #import <AppKit/AppKit.h>
 #import <CoreText/CoreText.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 
+#include <spawn.h>
+
 #include "bowser.h"
+
+extern char **environ;
 
 static const double kFieldX = 40, kFieldY = 40, kFieldH = 44, kPad = 10;
 
@@ -320,7 +325,7 @@ static const double kFieldX = 40, kFieldY = 40, kFieldH = 44, kPad = 10;
 // ---- Callbacks ------------------------------------------------------
 
 static Scene *scene;
-static bool echo;
+static bool echo, spawn;
 static NSMutableArray<NSValue *> *surfaces; // index = surface number in --echo output
 
 // --echo prints every event a surface receives, for the end-to-end test.
@@ -341,7 +346,7 @@ static void on_wakeup(void *ud) {
   dispatch_async(dispatch_get_main_queue(), ^{ bowser_producer_tick(scene.producer); });
 }
 static void on_key(void *ud, bowser_surface_t *s, const bowser_key_s *k) {
-  say(s, @"key %d %u %@", k->action, k->keycode, @(k->text ? k->text : ""));
+  say(s, @"key %d %u %@ %llu", k->action, k->keycode, @(k->text ? k->text : ""), k->timestamp_ns);
   if (is_scene(s)) [scene key:k];
 }
 static void on_mouse(void *ud, bowser_surface_t *s, const bowser_mouse_s *m) {
@@ -367,6 +372,11 @@ static void on_attach(void *ud, bowser_surface_t *s, bool attached) {
   say(s, @"%@", attached ? @"attached" : @"detached");
   if (!echo) fprintf(stderr, "host %s\n", attached ? "attached" : "detached");
   if (attached && is_scene(s)) [scene renderText]; // send the caret to the new host
+  if (attached && spawn) {
+    pid_t pid;
+    char *argv[] = {"/bin/sleep", "5", NULL};
+    posix_spawn(&pid, argv[0], NULL, NULL, argv, environ);
+  }
 }
 
 int main(int argc, char **argv) {
@@ -382,6 +392,8 @@ int main(int argc, char **argv) {
         count = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--echo"))
         echo = true;
+      else if (!strcmp(argv[i], "--spawn"))
+        spawn = true;
     }
 
     [NSApplication sharedApplication];

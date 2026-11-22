@@ -20,10 +20,13 @@ void bw_frame_server_free(bw_frame_server *);
 bool bw_frame_send(mach_port_t host_port, IOSurfaceRef, uint64_t seq);
 
 typedef struct bw_frame_client bw_frame_client;
-// Called on the client's receive thread. The callee owns the IOSurfaceRef.
+// Called on the client's receive thread. The callee owns the IOSurfaceRef and
+// one use count on it (IOSurfaceIncrementUseCount), which it must give back.
 typedef void (*bw_frame_fn)(void *ctx, IOSurfaceRef, uint64_t seq);
 
-bw_frame_client *bw_frame_client_new(const char *service, uint64_t nonce, bw_frame_fn, void *ctx);
+// Waits up to timeout_ms for the subscribe message to go through.
+bw_frame_client *bw_frame_client_new(const char *service, uint64_t nonce, mach_msg_timeout_t timeout_ms,
+                                     bw_frame_fn, void *ctx);
 void bw_frame_client_free(bw_frame_client *);
 
 #endif

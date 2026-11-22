@@ -1,5 +1,7 @@
 #include "wire.h"
 
+#include "../include/bowser.h"
+
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,35 +72,31 @@ char *bw_get_str(bw_rd *r) {
   return s;
 }
 
-static bool write_all(int fd, const void *p, size_t n) {
-  const uint8_t *c = p;
-  while (n) {
-    ssize_t w = write(fd, c, n);
-    if (w < 0) {
-      if (errno == EINTR) continue;
-      if (errno == EAGAIN) { usleep(100); continue; }
-      return false;
-    }
-    c += w;
-    n -= (size_t)w;
-  }
-  return true;
+void bw_put_frame(bw_buf *out, uint16_t type, const bw_buf *payload) {
+  uint32_t len = payload ? (uint32_t)payload->len : 0;
+  put(out, &len, 4);
+  put(out, &type, 2);
+  if (len) put(out, payload->data, len);
 }
 
-bool bw_send(int fd, uint16_t type, const bw_buf *payload) {
-  if (fd < 0) return false;
-  uint32_t len = payload ? (uint32_t)payload->len : 0;
-  uint8_t hdr[6];
-  memcpy(hdr, &len, 4);
-  memcpy(hdr + 4, &type, 2);
-  // One buffer, one write: small frames never interleave across threads that
-  // hold the connection's send lock.
-  bw_buf out = {0};
-  put(&out, hdr, 6);
-  if (len) put(&out, payload->data, len);
-  bool ok = write_all(fd, out.data, out.len);
-  bw_buf_free(&out);
-  return ok;
+uint32_t bw_latest_wins_kind(uint16_t type, const bw_buf *payload) {
+  switch (type) {
+  case BW_MSG_RESIZE:
+  case BW_MSG_CARET:
+  case BW_MSG_COMPOSITION:
+  case BW_MSG_CURSOR:
+    return type;
+  case BW_MSG_MOUSE: {
+    // Moves and drags are positions, so only the newest matters. Clicks and
+    // exits must all arrive. Scroll deltas add up, so scrolls aren't merged.
+    bw_rd r = {.p = payload->data, .left = payload->len};
+    uint32_t action = bw_get_u32(&r);
+    if (r.err || (action != BOWSER_MOUSE_MOVE && action != BOWSER_MOUSE_DRAG)) return 0;
+    return (uint32_t)type << 8 | action;
+  }
+  default:
+    return 0;
+  }
 }
 
 bool bw_recv_some(int fd, bw_buf *acc) {
@@ -131,20 +129,4 @@ bool bw_next_frame(bw_buf *acc, uint16_t *type, bw_buf *payload, bool *bad) {
   memmove(acc->data, acc->data + 6 + len, acc->len - 6 - len);
   acc->len -= 6 + len;
   return true;
-}
-
-bool bw_recv_frame_blocking(int fd, bw_buf *acc, uint16_t *type, bw_buf *payload) {
-  for (;;) {
-    bool bad;
-    if (bw_next_frame(acc, type, payload, &bad)) return true;
-    if (bad) return false;
-    reserve(acc, 4096);
-    ssize_t n = read(fd, acc->data + acc->len, acc->cap - acc->len);
-    if (n > 0) {
-      acc->len += (size_t)n;
-      continue;
-    }
-    if (n < 0 && errno == EINTR) continue;
-    return false;
-  }
 }

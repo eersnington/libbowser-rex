@@ -8,19 +8,21 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BW_TICKET_PREFIX "bowser1:"
+#define BW_TICKET_PREFIX "bowser2:" // bump when the wire format changes
 #define BW_TOKEN_LEN 32
-#define BW_MAX_FRAME (1u << 20)
+#define BW_MAX_FRAME (1u << 20)  // largest payload either side sends or accepts
+#define BW_MAX_QUEUED (4u << 20) // unsent bytes a connection holds before it drops the peer as stalled
 
 typedef enum {
   // host -> producer
   BW_MSG_HELLO = 1, // str token
   BW_MSG_RESIZE,    // f64 w, h, scale
   BW_MSG_FOCUS,     // u8
-  BW_MSG_KEY,       // u32 action, u32 keycode, u64 mods, str text, str unmodified
-  BW_MSG_MOUSE,     // u32 action, i32 button, f64 x, y, i32 clicks, u64 mods
-  BW_MSG_SCROLL,    // f64 dx, dy, u8 precise, i32 phase, i32 momentum, f64 x, y, u64 mods
+  BW_MSG_KEY,       // u32 action, u32 keycode, u64 mods, str text, str unmodified, u64 timestamp
+  BW_MSG_MOUSE,     // u32 action, i32 button, f64 x, y, i32 clicks, u64 mods, u64 timestamp
+  BW_MSG_SCROLL,    // f64 dx, dy, u8 precise, i32 phase, i32 momentum, f64 x, y, u64 mods, u64 timestamp
   BW_MSG_TEXT,      // u32 kind, str text, i64 sel loc, len, i64 repl loc, len
+  BW_MSG_READY,     // empty; the host is set up, so the producer commits the attach
   // producer -> host
   BW_MSG_WELCOME = 100, // u32 transport, u32 context id, f64 w, h, scale, str mach service, u64 nonce
   BW_MSG_REJECT,        // u32 bowser_result_e
@@ -58,15 +60,17 @@ int64_t bw_get_i64(bw_rd *);
 double bw_get_f64(bw_rd *);
 char *bw_get_str(bw_rd *); // malloc'd, NUL-terminated; free it
 
-// Write one whole frame. Returns false if the socket failed.
-bool bw_send(int fd, uint16_t type, const bw_buf *payload);
+// Append one whole frame, header and payload, to out.
+void bw_put_frame(bw_buf *out, uint16_t type, const bw_buf *payload);
+
+// Frames with the same nonzero kind are latest-wins: a queued one may be
+// dropped when a newer one follows. 0 means the frame must arrive.
+uint32_t bw_latest_wins_kind(uint16_t type, const bw_buf *payload);
 
 // Read whatever is available into acc. Returns false on EOF or error.
 bool bw_recv_some(int fd, bw_buf *acc);
 // Pop one complete frame from acc. Returns false if none is complete yet.
 // Sets *bad if the stream is corrupt.
 bool bw_next_frame(bw_buf *acc, uint16_t *type, bw_buf *payload, bool *bad);
-// Block until one whole frame arrives (used for the handshake).
-bool bw_recv_frame_blocking(int fd, bw_buf *acc, uint16_t *type, bw_buf *payload);
 
 #endif

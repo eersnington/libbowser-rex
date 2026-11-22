@@ -59,6 +59,49 @@ back.**
 4. The host mounts the layer and sends input and size.
 5. The host detaches, or the connection drops. The surface keeps running.
 
+#### Tickets
+
+- A ticket works once and expires 60 s after it is made, like a Rex data ticket. The producer prunes expired tickets each time it makes or redeems one.
+- Attaching with a ticket replaces the surface's current host. It does **not** invalidate the surface's other unused tickets. Each ticket was handed to a client the producer trusts, and the TTL bounds how stale one can be. Invalidating the others would only make clients that race fail and fetch a new ticket, with no clearer winner.
+- Test hook: `BOWSER_TICKET_TTL_MS` in the producer's environment overrides the 60 s. Only the tests use it.
+
+#### Attach handshake
+
+```mermaid
+sequenceDiagram
+  participant H as New host
+  participant P as Producer
+  participant O as Old host
+  H->>P: HELLO token
+  P->>H: WELCOME (or REJECT)
+  Note over P: ticket consumed; old host still attached
+  H->>P: SUBSCRIBE over Mach (IOSURFACE only)
+  H->>P: READY
+  Note over P: commit
+  P->>O: DETACH REPLACED
+  P-->>P: attach_cb(true)
+```
+
+- `bowser_host_attach` is synchronous, with one total deadline of 3 s from the call. It returns only after the host is fully set up.
+- The producer commits on READY, not on WELCOME. READY is the only signal that the new host's attach succeeded, on both transports. So a host that fails after WELCOME (subscribe fails, deadline passes, the process dies) leaves the current host attached. Its ticket is still used up.
+- SUBSCRIBE and READY travel on different channels, so they can arrive in either order. Frames start once both have arrived.
+
+#### Connections
+
+- Send functions never write to the socket or block. They queue the message, and a write source drains the queue on the library's io queue. So a stalled or stopped peer can't hang the embedder's thread, and no lock is held across a call into the other process.
+- Latest-wins messages replace an older unsent one of the same kind: resize, mouse move, mouse drag, caret, composition, cursor. The replacement only skips over other latest-wins messages, so the peer sees a subsequence of what was sent, with only superseded states missing. Clicks, keys, text, focus, and scroll always arrive. Scroll deltas add up, so merging them would need phase rules; that waits for a real need.
+- A message over 1 MiB is refused at the call with `BOWSER_ERR_INVALID`. The connection stays up.
+- If a peer leaves 4 MiB unread, the library drops it: the call returns `BOWSER_ERR_STALLED`, and the host gets `detached_cb(BOWSER_ERR_STALLED)`.
+- A producer that doesn't tick stops reading after 4096 queued input events. The back pressure lands in its hosts' send queues, where moves merge, and finally the hosts drop it as stalled.
+- `bowser_host_detach` and `bowser_surface_free` still deliver what was queued before them. A peer that doesn't read gets 1 s.
+
+#### Security
+
+- The socket lives in a fresh `mkdtemp` directory (mode 0700), so only the producer's user can reach it, from the moment it exists.
+- Both sides check the peer's uid with `getpeereid` and refuse other users. The host checks too, because it sends the producer keystrokes.
+- Every socket is close-on-exec. Otherwise a child (a Rex shell, a CEF helper) inherits an authenticated connection, and the other side never sees EOF. macOS has no `SOCK_CLOEXEC` or `accept4`, so this is `fcntl` right after `socket()` and `accept()`. A thread that spawns a child in that gap can still leak the fd; such embedders should spawn with `POSIX_SPAWN_CLOEXEC_DEFAULT`.
+- The Mach frame service is public within the bootstrap namespace. It accepts only exactly formed messages and destroys everything else, including reply and voucher rights.
+
 ## Transports
 
 The transport is hidden behind the ABI. 0.x ships two, so they can be
@@ -78,13 +121,15 @@ compared on the same producer.
 Conventions, the same as libghostty:
 
 - Opaque handles: `bowser_*_t`.
-- Config structs passed by pointer, with a `size` field first for forward compatibility.
-- Callbacks take a `void *userdata`.
-- **Threading:** the library never calls host code on an arbitrary thread to do work. It calls `wakeup_cb`, and the host then calls `*_tick()` on its own thread. Every other callback runs inside `*_tick()`.
-- Errors: functions return `bowser_result_e`. `bowser_last_error()` returns a message for the calling thread.
+- Config structs passed by pointer, with a `size` field first for forward compatibility. They grow only at the end. The library accepts any size from `BOWSER_*_CONFIG_MIN_SIZE` up and zero-fills missing fields. In 0.x the minimum is the whole struct; at 1.0 it freezes at the 1.0 layout.
+- Callbacks take a `void *userdata`. Pointers a callback gets are valid only until it returns.
+- **Threading:** each producer or host belongs to the embedder's thread. The library never calls host code on an arbitrary thread to do work. It calls `wakeup_cb`, from any thread, and the embedder then calls `*_tick()` on its own thread. `wakeup_cb` must not block or call into the library. Every other callback runs inside `*_tick()`. Only `bowser_abi_version`, `bowser_last_error`, and `bowser_string_free` are safe on any thread.
+- Errors: functions return `bowser_result_e`. A failing call sets `bowser_last_error()` for the calling thread; success doesn't clear it.
+- **Free order:** free surfaces before their producer. A surface whose producer is gone stays a valid, inert handle until `bowser_surface_free`. `bowser_host_detach` frees the host at once, so a tick the embedder scheduled earlier must check that the host still exists. Detaching or freeing from inside a callback is safe: that object gets no more callbacks.
+- **Timestamps:** key, mouse, and scroll input carry `timestamp_ns` in `CLOCK_UPTIME_RAW` nanoseconds, the clock behind `NSEvent.timestamp` and `CACurrentMediaTime()`. Producers get click and scroll velocity, and input-to-photon latency becomes measurable. 0 means the library stamps the event when it is sent.
 
 ```c
-// bowser.h (draft)
+// bowser.h (draft; include/bowser.h is the source of truth)
 
 #define BOWSER_ABI_VERSION 0
 
@@ -94,6 +139,8 @@ typedef enum {
   BOWSER_ERR_TICKET,      // expired, used, or unknown ticket
   BOWSER_ERR_TRANSPORT,   // transport not supported here
   BOWSER_ERR_DISCONNECTED,
+  BOWSER_ERR_REPLACED,    // another host attached to the surface
+  BOWSER_ERR_STALLED,     // the other side stopped reading, so it was dropped
 } bowser_result_e;
 
 typedef enum {
@@ -133,7 +180,7 @@ void            bowser_producer_tick(bowser_producer_t *);
 
 bowser_result_e bowser_surface_new(bowser_producer_t *, bowser_size_s, bowser_surface_t **out);
 void            bowser_surface_free(bowser_surface_t *);
-// A fresh single-use ticket for a host to attach with. Caller frees with bowser_string_free.
+// A fresh ticket: single use, valid for 60 s. Caller frees with bowser_string_free.
 char           *bowser_surface_ticket(bowser_surface_t *);
 
 // Frame output. Use the one that matches the transport.
@@ -141,11 +188,11 @@ CALayer        *bowser_surface_root_layer(bowser_surface_t *);   // CALAYERHOST:
 bowser_result_e bowser_surface_present(bowser_surface_t *,       // IOSURFACE: hand over a frame
                                        IOSurfaceRef, bowser_rect_s dirty);
 
-// Text input state the host needs to place the IME window.
-void bowser_surface_set_caret(bowser_surface_t *, bowser_rect_s caret);
-void bowser_surface_set_composition(bowser_surface_t *, bool active,
-                                    const bowser_rect_s *char_rects, size_t count);
-void bowser_surface_set_cursor(bowser_surface_t *, int bowser_cursor_shape);
+// Text input state the host needs to place the IME window. Senders never block.
+bowser_result_e bowser_surface_set_caret(bowser_surface_t *, bowser_rect_s caret);
+bowser_result_e bowser_surface_set_composition(bowser_surface_t *, bool active,
+                                               const bowser_rect_s *char_rects, size_t count);
+bowser_result_e bowser_surface_set_cursor(bowser_surface_t *, int bowser_cursor_shape);
 
 // ---- Host side ------------------------------------------------------
 
@@ -170,12 +217,13 @@ void            bowser_host_tick(bowser_host_t *);
 
 CALayer *bowser_host_layer(bowser_host_t *);   // mount in any NSView; same for both transports
 
-void bowser_host_resize(bowser_host_t *, bowser_size_s);
-void bowser_host_focus(bowser_host_t *, bool focused);
-void bowser_host_key(bowser_host_t *, const struct bowser_key_s *);
-void bowser_host_mouse(bowser_host_t *, const struct bowser_mouse_s *);
-void bowser_host_scroll(bowser_host_t *, const struct bowser_scroll_s *);
-void bowser_host_text(bowser_host_t *, const struct bowser_text_s *);
+// Senders never block. See "Connections".
+bowser_result_e bowser_host_resize(bowser_host_t *, bowser_size_s);
+bowser_result_e bowser_host_focus(bowser_host_t *, bool focused);
+bowser_result_e bowser_host_key(bowser_host_t *, const struct bowser_key_s *);
+bowser_result_e bowser_host_mouse(bowser_host_t *, const struct bowser_mouse_s *);
+bowser_result_e bowser_host_scroll(bowser_host_t *, const struct bowser_scroll_s *);
+bowser_result_e bowser_host_text(bowser_host_t *, const struct bowser_text_s *);
 
 void bowser_string_free(char *);
 ```
@@ -187,9 +235,9 @@ events for the engine.
 
 | Struct | Fields |
 |---|---|
-| `bowser_key_s` | action (press, release, repeat), macOS key code, modifiers, characters, characters without modifiers |
-| `bowser_mouse_s` | action (down, up, move, drag), button, position in points, click count, modifiers |
-| `bowser_scroll_s` | delta x and y, precise (trackpad) or line, momentum and gesture phase |
+| `bowser_key_s` | action (press, release, repeat), macOS key code, modifiers, characters, characters without modifiers, timestamp |
+| `bowser_mouse_s` | action (down, up, move, drag, exit), button, position in points, click count, modifiers, timestamp |
+| `bowser_scroll_s` | delta x and y, precise (trackpad) or line, momentum and gesture phase, position, modifiers, timestamp |
 | `bowser_text_s` | kind (insert, set marked, unmark), UTF-8 text, selected range, replacement range |
 
 ### Text input
@@ -256,7 +304,7 @@ libbowser/
 
 ## Open questions
 
-- **Ticket exchange.** XPC needs a named mach service or a passed endpoint. Use a launchd-free anonymous listener, with its endpoint carried in the ticket by a broker process? Decide in step 1.
+- **Ticket exchange.** Decided in step 1: a Unix socket in a 0700 directory carries control, the ticket is `bowser2:<socket path>#<token>`, and IOSURFACE frames use a bootstrap Mach service named in WELCOME.
 - **Rex integration.** Rex lists only first-party creators today. A browser block needs a creator API or first-party support.
 - **Who renders the cursor.** The producer sends a cursor shape and the host sets `NSCursor`. Custom image cursors need a bitmap path.
 - **Popups and `<select>` menus.** CEF draws some popups in a separate paint type. Composite them in the producer, or give the host a second layer?

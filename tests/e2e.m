@@ -5,8 +5,12 @@
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
 
+#include <mach/mach.h>
+#include <servers/bootstrap.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "bowser.h"
@@ -47,6 +51,10 @@ static void pump(double seconds) {
 @implementation Producer
 
 + (instancetype)start:(NSArray<NSString *> *)args tickets:(int)count {
+  return [self start:args tickets:count env:@{}];
+}
+
++ (instancetype)start:(NSArray<NSString *> *)args tickets:(int)count env:(NSDictionary<NSString *, NSString *> *)env {
   Producer *p = [Producer new];
   int fds[2];
   pipe(fds);
@@ -58,8 +66,17 @@ static void pump(double seconds) {
   [all addObjectsFromArray:args];
   char *argv[16] = {0};
   for (NSUInteger i = 0; i < all.count && i < 15; i++) argv[i] = (char *)[all[i] UTF8String];
+  NSMutableArray<NSString *> *vars = [NSMutableArray new];
+  for (char **e = environ; *e; e++) [vars addObject:@(*e)];
+  [env enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+    [vars addObject:[NSString stringWithFormat:@"%@=%@", k, v]];
+  }];
+  char **envp = calloc(vars.count + 1, sizeof *envp);
+  for (NSUInteger i = 0; i < vars.count; i++) envp[i] = (char *)vars[i].UTF8String;
   pid_t pid;
-  if (posix_spawn(&pid, argv[0], &fa, NULL, argv, environ) != 0) {
+  int spawned = posix_spawn(&pid, argv[0], &fa, NULL, argv, envp);
+  free(envp);
+  if (spawned != 0) {
     fprintf(stderr, "can't start %s\n", argv[0]);
     exit(1);
   }
@@ -111,8 +128,13 @@ static void pump(double seconds) {
 
 // Wait for an exact line, skipping others. Returns whether it arrived.
 - (BOOL)expect:(NSString *)line {
+  return [self expect:line within:3];
+}
+
+- (BOOL)expect:(NSString *)line within:(double)seconds {
+  NSDate *end = [NSDate dateWithTimeIntervalSinceNow:seconds];
   NSString *l;
-  while ((l = [self nextLine:3])) {
+  while ([end timeIntervalSinceNow] > 0 && (l = [self nextLine:[end timeIntervalSinceNow]])) {
     if ([l isEqualToString:line]) return YES;
   }
   return NO;
@@ -147,6 +169,10 @@ static void pump(double seconds) {
 @property BOOL gotCaret;
 @property BOOL composing;
 @property bowser_cursor_e cursor;
+@property BOOL manual; // wakeups only count; the test ticks by hand
+@property int wakeups;
+@property BOOL detachInCaret;
+@property int callbacksAfterDetach;
 @end
 
 @implementation Host
@@ -154,8 +180,12 @@ static void pump(double seconds) {
 
 static Host *from(void *ud) { return (__bridge Host *)ud; }
 
+static void detach(Host *h);
+
 static void on_wakeup(void *ud) {
   Host *host = from(ud);
+  host.wakeups++;
+  if (host.manual) return;
   dispatch_async(dispatch_get_main_queue(), ^{
     if (host.handle) bowser_host_tick(host.handle);
   });
@@ -163,18 +193,29 @@ static void on_wakeup(void *ud) {
 static void on_caret(void *ud, bowser_host_t *_, bowser_rect_s caret) {
   from(ud).caret = caret;
   from(ud).gotCaret = YES;
+  if (from(ud).detachInCaret) detach(from(ud));
 }
 static void on_composition(void *ud, bowser_host_t *_, bool active, const bowser_rect_s *r, size_t n) {
+  if (!from(ud).handle) from(ud).callbacksAfterDetach++;
   from(ud).composing = active;
 }
-static void on_cursor(void *ud, bowser_host_t *_, bowser_cursor_e c) { from(ud).cursor = c; }
+static void on_cursor(void *ud, bowser_host_t *_, bowser_cursor_e c) {
+  if (!from(ud).handle) from(ud).callbacksAfterDetach++;
+  from(ud).cursor = c;
+}
 static void on_detached(void *ud, bowser_host_t *_, bowser_result_e why) {
   from(ud).detached = YES;
   from(ud).detachedWhy = why;
 }
 
+static bowser_result_e attach_host(NSString *ticket, Host *h);
+
 static bowser_result_e attach(NSString *ticket, Host **out) {
-  Host *h = [Host new];
+  *out = [Host new];
+  return attach_host(ticket, *out);
+}
+
+static bowser_result_e attach_host(NSString *ticket, Host *h) {
   bowser_host_config_s cfg = {
       .size = sizeof cfg,
       .userdata = (__bridge void *)h,
@@ -191,7 +232,6 @@ static bowser_result_e attach(NSString *ticket, Host **out) {
     // Keep the host alive while its callbacks can still fire.
     CFBridgingRetain(h);
   }
-  *out = h;
   return rc;
 }
 
@@ -201,10 +241,12 @@ static void detach(Host *h) {
   bowser_host_detach(handle);
 }
 
-static void text(Host *h, bowser_text_kind_e kind, const char *s) {
+static bowser_result_e text_to(bowser_host_t *h, bowser_text_kind_e kind, const char *s) {
   bowser_text_s t = {.kind = kind, .text = s, .selected_location = -1, .replacement_location = -1};
-  bowser_host_text(h.handle, &t);
+  return bowser_host_text(h, &t);
 }
+
+static bowser_result_e text(Host *h, bowser_text_kind_e kind, const char *s) { return text_to(h.handle, kind, s); }
 
 static BOOL wait_for(BOOL (^cond)(void), double seconds) {
   NSDate *end = [NSDate dateWithTimeIntervalSinceNow:seconds];
@@ -225,7 +267,7 @@ static void test_input_reaches_producer_intact(void) {
 
   bowser_host_resize(h.handle, (bowser_size_s){640, 400, 2});
   bowser_host_focus(h.handle, true);
-  bowser_key_s k = {.action = BOWSER_KEY_PRESS, .keycode = 0, .text = "a"};
+  bowser_key_s k = {.action = BOWSER_KEY_PRESS, .keycode = 0, .text = "a", .timestamp_ns = 42};
   bowser_host_key(h.handle, &k);
   text(h, BOWSER_TEXT_SET_MARKED, "にほ");
   text(h, BOWSER_TEXT_INSERT, "日本");
@@ -235,7 +277,7 @@ static void test_input_reaches_producer_intact(void) {
   bowser_host_scroll(h.handle, &sc);
 
   NSArray *want = @[
-    @"s0 resize 640x400@2", @"s0 focus 1", @"s0 key 0 0 a", @"s0 text 1 にほ", @"s0 text 0 日本",
+    @"s0 resize 640x400@2", @"s0 focus 1", @"s0 key 0 0 a 42", @"s0 text 1 にほ", @"s0 text 0 日本",
     @"s0 mouse 0 0 12.5 34.0 2", @"s0 scroll 0.0 -10.0 1"
   ];
   NSMutableArray *got = [NSMutableArray new];
@@ -252,7 +294,7 @@ static void test_ticket_works_once(void) {
   Host *a, *b;
   CHECK(attach(p.tickets[0], &a) == BOWSER_OK, "first use: %s", bowser_last_error());
   CHECK(attach(p.tickets[0], &b) == BOWSER_ERR_TICKET, "second use must fail with a ticket error");
-  CHECK(attach(@"bowser1:/nonexistent.sock#00", &b) == BOWSER_ERR_TICKET, "a dead producer is a ticket error");
+  CHECK(attach(@"bowser2:/nonexistent.sock#00", &b) == BOWSER_ERR_TICKET, "a dead producer is a ticket error");
   detach(a);
   [p kill];
 }
@@ -370,6 +412,415 @@ static void test_iosurface_host_shows_producer_pixels(void) {
   [p kill];
 }
 
+// Run work off the main thread, so a send that blocks shows up as a timeout
+// instead of a hung test. Returns the seconds it took, or -1 past the limit.
+static double timed(double limit, void (^work)(void)) {
+  dispatch_semaphore_t done = dispatch_semaphore_create(0);
+  __block double took = 0;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    double t0 = CACurrentMediaTime();
+    work();
+    took = CACurrentMediaTime() - t0;
+    dispatch_semaphore_signal(done);
+  });
+  bool ok = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(limit * NSEC_PER_SEC))) == 0;
+  return ok ? took : -1;
+}
+
+// Wait for sends that may still be blocked, while draining the producer's
+// output so it can't block on it in turn. Kills the producer if they hang.
+static BOOL await_sends(dispatch_semaphore_t finished, Producer *p) {
+  NSDate *end = [NSDate dateWithTimeIntervalSinceNow:5];
+  while (dispatch_semaphore_wait(finished, DISPATCH_TIME_NOW) != 0) {
+    if ([end timeIntervalSinceNow] < 0) {
+      [p kill];
+      dispatch_semaphore_wait(finished, DISPATCH_TIME_FOREVER);
+      return NO;
+    }
+    [p drain];
+    pump(0.01);
+  }
+  return YES;
+}
+
+static void test_stalled_producer_never_blocks_the_host(void) {
+  Producer *p = [Producer start:@[] tickets:1];
+  Host *h;
+  CHECK(attach(p.tickets[0], &h) == BOWSER_OK, "attach");
+  CHECK([p expect:@"s0 attached"], "attached");
+  kill(p.pid, SIGSTOP);
+  bowser_host_t *handle = h.handle;
+  __block bool allOk = true;
+  dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+  double took = timed(2, ^{
+    // About 6 MB unmerged: more than a peer may leave unread.
+    for (int i = 0; i < 100000; i++) {
+      bowser_mouse_s m = {.action = BOWSER_MOUSE_MOVE, .x = i, .y = 1};
+      allOk &= bowser_host_mouse(handle, &m) == BOWSER_OK;
+    }
+    allOk &= text_to(handle, BOWSER_TEXT_INSERT, "after-stall") == BOWSER_OK;
+    dispatch_semaphore_signal(finished);
+  });
+  CHECK(took >= 0 && took < 1, "100k sends to a stopped producer return within 1 s (took %.2f s)", took);
+  kill(p.pid, SIGCONT);
+  if (!await_sends(finished, p)) return;
+  CHECK(allOk, "every send was accepted: moves replace each other, so the queue stays small");
+  CHECK([p expect:@"s0 mouse 2 0 99999.0 1.0 0"], "the newest mouse position arrives after the producer resumes");
+  CHECK([p expect:@"s0 text 0 after-stall"], "input after the moves arrives, in order");
+  CHECK(!h.detached, "the host stays attached");
+  detach(h);
+  [p kill];
+}
+
+static void test_host_drops_a_producer_that_stops_reading(void) {
+  Producer *p = [Producer start:@[] tickets:1];
+  Host *h;
+  CHECK(attach(p.tickets[0], &h) == BOWSER_OK, "attach");
+  CHECK([p expect:@"s0 attached"], "attached");
+  kill(p.pid, SIGSTOP);
+  bowser_host_t *handle = h.handle;
+  __block bowser_result_e failure = BOWSER_OK;
+  dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+  double took = timed(2, ^{
+    char *big = malloc(100000);
+    memset(big, 'x', 99999);
+    big[99999] = 0;
+    // Text must all arrive, so it can't be merged; 10 MB overflows the queue.
+    for (int i = 0; i < 100 && !failure; i++) failure = text_to(handle, BOWSER_TEXT_INSERT, big);
+    free(big);
+    dispatch_semaphore_signal(finished);
+  });
+  CHECK(took >= 0 && took < 1, "sends return within 1 s (took %.2f s)", took);
+  kill(p.pid, SIGCONT);
+  if (!await_sends(finished, p)) return;
+  CHECK(failure == BOWSER_ERR_STALLED, "the send that overflows returns STALLED, got %d", failure);
+  CHECK(wait_for(^{ return h.detached; }, 1), "the host is told it was dropped");
+  CHECK(h.detachedWhy == BOWSER_ERR_STALLED, "reason is STALLED, got %d", h.detachedWhy);
+  CHECK([p expect:@"s0 detached" within:5], "the producer sees the host go once it resumes");
+  detach(h);
+  [p kill];
+}
+
+static void test_failed_attach_leaves_the_current_host(void) {
+  Producer *p = [Producer start:@[ @"--tickets", @"2" ] tickets:2];
+  Host *a, *b;
+  CHECK(attach(p.tickets[0], &a) == BOWSER_OK, "attach a");
+  CHECK([p expect:@"s0 attached"], "a attached");
+  kill(p.pid, SIGSTOP);
+  double t0 = CACurrentMediaTime();
+  bowser_result_e rc = attach(p.tickets[1], &b);
+  double took = CACurrentMediaTime() - t0;
+  CHECK(rc == BOWSER_ERR_DISCONNECTED, "attaching to a stopped producer fails, got %d", rc);
+  CHECK(took < 3.5, "within the 3 s attach deadline (took %.2f s)", took);
+  kill(p.pid, SIGCONT); // now the producer answers b, which is gone
+  pump(0.5);
+  CHECK(!a.detached, "the failed host didn't replace the current one");
+  text(a, BOWSER_TEXT_INSERT, "still-a");
+  CHECK([p expect:@"s0 text 0 still-a"], "the current host's input still arrives");
+  detach(a);
+  [p kill];
+}
+
+static pid_t spawn_sleeper(void) {
+  pid_t pid;
+  char *argv[] = {"/bin/sleep", "5", NULL};
+  posix_spawn(&pid, argv[0], NULL, NULL, argv, environ);
+  return pid;
+}
+
+static void reap(pid_t pid) {
+  kill(pid, SIGKILL);
+  waitpid(pid, NULL, 0);
+}
+
+static void test_host_children_dont_keep_it_attached(void) {
+  Producer *p = [Producer start:@[] tickets:1];
+  Host *h;
+  CHECK(attach(p.tickets[0], &h) == BOWSER_OK, "attach");
+  CHECK([p expect:@"s0 attached"], "attached");
+  pid_t child = spawn_sleeper(); // like a host starting a shell
+  detach(h);
+  CHECK([p expect:@"s0 detached" within:1], "the producer sees the detach within 1 s, while the child lives");
+  reap(child);
+  [p kill];
+}
+
+static void test_producer_children_dont_hide_its_death(void) {
+  Producer *p = [Producer start:@[ @"--spawn" ] tickets:1];
+  Host *h;
+  CHECK(attach(p.tickets[0], &h) == BOWSER_OK, "attach");
+  CHECK([p expect:@"s0 attached"], "attached, and the producer started a child");
+  [p kill];
+  CHECK(wait_for(^{ return h.detached; }, 1), "the host learns the producer died within 1 s, while its child lives");
+  detach(h);
+}
+
+static void test_expired_ticket_is_refused(void) {
+  Producer *p = [Producer start:@[ @"--tickets", @"2" ] tickets:2 env:@{@"BOWSER_TICKET_TTL_MS" : @"500"}];
+  Host *a, *b;
+  CHECK(attach(p.tickets[0], &a) == BOWSER_OK, "a ticket works within its lifetime: %s", bowser_last_error());
+  pump(0.8);
+  CHECK(attach(p.tickets[1], &b) == BOWSER_ERR_TICKET, "an expired ticket is refused");
+  pump(0.2);
+  CHECK(!a.detached, "and doesn't take the surface from the current host");
+  detach(a);
+  [p kill];
+}
+
+static void test_oversize_text_is_refused_not_fatal(void) {
+  Producer *p = [Producer start:@[] tickets:1];
+  Host *h;
+  CHECK(attach(p.tickets[0], &h) == BOWSER_OK, "attach");
+  size_t n = 3 << 19; // 1.5 MB
+  char *big = malloc(n + 1);
+  memset(big, 'x', n);
+  big[n] = 0;
+  CHECK(text(h, BOWSER_TEXT_INSERT, big) == BOWSER_ERR_INVALID, "a message over 1 MiB is refused at the call");
+  free(big);
+  text(h, BOWSER_TEXT_INSERT, "after-big");
+  CHECK([p expect:@"s0 text 0 after-big"], "the connection still carries input");
+  CHECK(!h.detached, "the host stays attached");
+  detach(h);
+  [p kill];
+}
+
+static void test_detach_in_a_callback_ends_callbacks(void) {
+  Producer *p = [Producer start:@[] tickets:1];
+  Host *h = [Host new];
+  h.manual = YES;
+  h.detachInCaret = YES;
+  CHECK(attach_host(p.tickets[0], h) == BOWSER_OK, "attach");
+  bowser_mouse_s over = {.action = BOWSER_MOUSE_MOVE, .x = 100, .y = 60};
+  bowser_host_mouse(h.handle, &over); // the producer answers with a cursor
+  CHECK([p expect:@"s0 mouse 2 0 100.0 60.0 0"], "producer got the move");
+  pump(0.2); // caret, composition, and cursor are now waiting for one tick
+  bowser_host_tick(h.handle);
+  CHECK(h.gotCaret && !h.handle, "the caret callback ran and detached the host");
+  CHECK(h.callbacksAfterDetach == 0, "no callback runs after the detach, got %d", h.callbacksAfterDetach);
+  [p kill];
+}
+
+// ---- In-process producer, for checks only the producer side can see -----
+
+@interface Local : NSObject
+@property bowser_producer_t *producer;
+@property bowser_surface_t *surface;
+@property int attaches;
+@end
+
+@implementation Local
+@end
+
+static void local_wakeup(void *ud) {
+  Local *l = (__bridge Local *)ud;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (l.producer) bowser_producer_tick(l.producer);
+  });
+}
+static void local_attach(void *ud, bowser_surface_t *s, bool attached) {
+  if (attached) ((__bridge Local *)ud).attaches++;
+}
+
+static Local *local_start(void) {
+  Local *l = [Local new];
+  bowser_producer_config_s cfg = {
+      .size = sizeof cfg,
+      .transport = BOWSER_TRANSPORT_IOSURFACE,
+      .userdata = (__bridge void *)l,
+      .wakeup_cb = local_wakeup,
+      .attach_cb = local_attach,
+  };
+  bowser_producer_t *producer;
+  bowser_surface_t *surface;
+  if (bowser_producer_new(&cfg, &producer) != BOWSER_OK ||
+      bowser_surface_new(producer, (bowser_size_s){64, 64, 1}, &surface) != BOWSER_OK) {
+    fprintf(stderr, "in-process producer: %s\n", bowser_last_error());
+    exit(1);
+  }
+  l.producer = producer;
+  l.surface = surface;
+  CFBridgingRetain(l);
+  return l;
+}
+
+static void local_free(Local *l) {
+  bowser_surface_free(l.surface);
+  bowser_producer_t *producer = l.producer;
+  l.producer = NULL;
+  bowser_producer_free(producer);
+}
+
+static NSString *local_ticket(Local *l) {
+  char *t = bowser_surface_ticket(l.surface);
+  NSString *s = @(t);
+  bowser_string_free(t);
+  return s;
+}
+
+static IOSurfaceRef make_iosurface(void) {
+  return IOSurfaceCreate((__bridge CFDictionaryRef) @{
+    (id)kIOSurfaceWidth : @64,
+    (id)kIOSurfaceHeight : @64,
+    (id)kIOSurfaceBytesPerElement : @4,
+    (id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
+  });
+}
+
+// Present until a subscribed host takes it, then wait for the host to have it.
+static BOOL deliver(Local *l, Host *h, IOSurfaceRef frame) {
+  int before = h.wakeups;
+  bowser_rect_s all = {0, 0, 64, 64};
+  return wait_for(^{ return (BOOL)(bowser_surface_present(l.surface, frame, all) == BOWSER_OK); }, 2) &&
+         wait_for(^{ return (BOOL)(h.wakeups > before); }, 2);
+}
+
+static void test_host_keeps_its_frames_in_use(void) {
+  Local *l = local_start();
+  Host *h = [Host new];
+  h.manual = YES;
+  CHECK(attach_host(local_ticket(l), h) == BOWSER_OK, "attach: %s", bowser_last_error());
+  CHECK(wait_for(^{ return (BOOL)(l.attaches == 1); }, 2), "producer sees the host");
+  IOSurfaceRef a = make_iosurface(), b = make_iosurface();
+
+  CHECK(deliver(l, h, a), "host gets frame a");
+  CHECK(IOSurfaceIsInUse(a), "a frame the host holds but hasn't shown is in use, so the producer won't draw into it");
+  bowser_host_tick(h.handle);
+  CHECK(IOSurfaceIsInUse(a), "the frame on screen is in use");
+  CHECK(deliver(l, h, b), "host gets frame b");
+  bowser_host_tick(h.handle);
+  CHECK(!IOSurfaceIsInUse(a), "a replaced frame is free to draw into again");
+  CHECK(IOSurfaceIsInUse(b), "the new frame is in use");
+  detach(h);
+  CHECK(!IOSurfaceIsInUse(b), "a detached host frees its frames");
+  CFRelease(a);
+  CFRelease(b);
+  local_free(l);
+}
+
+// Do the handshake by hand to learn the producer's Mach frame service name.
+static NSString *frame_service(NSString *ticket) {
+  NSString *rest = [ticket substringFromIndex:strlen("bowser2:")];
+  NSRange hash = [rest rangeOfString:@"#" options:NSBackwardsSearch];
+  NSString *path = [rest substringToIndex:hash.location], *token = [rest substringFromIndex:hash.location + 1];
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  struct sockaddr_un addr = {.sun_family = AF_UNIX};
+  strlcpy(addr.sun_path, path.UTF8String, sizeof addr.sun_path);
+  if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) return nil;
+  uint32_t n = (uint32_t)token.length, len = 4 + n;
+  uint16_t type = 1; // HELLO
+  NSMutableData *hello = [NSMutableData new];
+  [hello appendBytes:&len length:4];
+  [hello appendBytes:&type length:2];
+  [hello appendBytes:&n length:4];
+  [hello appendBytes:token.UTF8String length:n];
+  write(fd, hello.bytes, hello.length);
+  uint8_t buf[512];
+  ssize_t got = read(fd, buf, sizeof buf); // WELCOME: u32 transport, u32 context, 3 f64, str service, u64
+  close(fd);
+  size_t at = 6 + 4 + 4 + 24;
+  if (got < (ssize_t)(at + 4)) return nil;
+  memcpy(&n, buf + at, 4);
+  if (at + 4 + n > (size_t)got) return nil;
+  return [[NSString alloc] initWithBytes:buf + at + 4 length:n encoding:NSUTF8StringEncoding];
+}
+
+typedef struct {
+  mach_msg_header_t header;
+  mach_msg_body_t body;
+  mach_msg_port_descriptor_t port;
+  uint64_t value;
+} sub_msg;
+
+static int dead_names(void) {
+  mach_port_name_array_t names;
+  mach_port_type_array_t types;
+  mach_msg_type_number_t n, tn;
+  mach_port_names(mach_task_self(), &names, &n, &types, &tn);
+  int dead = 0;
+  for (mach_msg_type_number_t i = 0; i < tn; i++) dead += (types[i] & MACH_PORT_TYPE_DEAD_NAME) != 0;
+  vm_deallocate(mach_task_self(), (vm_address_t)names, n * sizeof *names);
+  vm_deallocate(mach_task_self(), (vm_address_t)types, tn * sizeof *types);
+  return dead;
+}
+
+static void test_frame_service_survives_hostile_messages(void) {
+  Local *l = local_start();
+  NSString *service = frame_service(local_ticket(l));
+  CHECK(service != nil, "learned the frame service");
+  mach_port_t server = MACH_PORT_NULL;
+  CHECK(bootstrap_look_up(bootstrap_port, service.UTF8String, &server) == KERN_SUCCESS, "look up the service");
+
+  // Each message carries rights to a fresh port of ours. The producer runs in
+  // this task, so any right it keeps lingers as a dead name once we destroy
+  // the port.
+  int deadBefore = dead_names();
+  enum { ROUNDS = 40 };
+  NSMutableArray<NSNumber *> *ports = [NSMutableArray new];
+  for (int i = 0; i < ROUNDS * 5; i++) {
+    mach_port_t mine;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &mine);
+    [ports addObject:@(mine)];
+    sub_msg m = {0};
+    m.header.msgh_bits = MACH_MSGH_BITS_SET(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE, 0, 0);
+    m.header.msgh_size = sizeof m;
+    m.header.msgh_remote_port = server;
+    m.header.msgh_local_port = mine; // a reply right the producer must release
+    m.header.msgh_id = 0x626f7701;   // SUBSCRIBE
+    m.value = arc4random();          // no such nonce
+    switch (i % 5) {
+    case 0: // well formed, unknown nonce
+    case 1: // wrong id
+    case 2: // the right is send-once, not send
+      m.header.msgh_bits |= MACH_MSGH_BITS_COMPLEX;
+      m.body.msgh_descriptor_count = 1;
+      m.port.name = mine;
+      m.port.disposition = i % 5 == 2 ? MACH_MSG_TYPE_MAKE_SEND_ONCE : MACH_MSG_TYPE_MAKE_SEND;
+      m.port.type = MACH_MSG_PORT_DESCRIPTOR;
+      if (i % 5 == 1) m.header.msgh_id = 0x626f7702;
+      break;
+    case 3: // not complex at all
+      break;
+    case 4: { // memory where a port should be
+      mach_msg_ool_descriptor_t *ool = (mach_msg_ool_descriptor_t *)&m.port;
+      static char page[4096];
+      m.header.msgh_bits |= MACH_MSGH_BITS_COMPLEX;
+      m.body.msgh_descriptor_count = 1;
+      ool->address = page;
+      ool->size = sizeof page;
+      ool->copy = MACH_MSG_VIRTUAL_COPY;
+      ool->type = MACH_MSG_OOL_DESCRIPTOR;
+      break;
+    }
+    }
+    mach_msg(&m.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof m, 0, MACH_PORT_NULL, 1000, MACH_PORT_NULL);
+  }
+  // The producer handles messages in order. When it releases the reply right
+  // of the last one, the kernel tells that port, so all have been handled.
+  mach_port_t last = (mach_port_t)ports.lastObject.unsignedIntValue;
+  struct {
+    mach_msg_header_t header;
+    mach_msg_max_trailer_t trailer;
+  } note;
+  kern_return_t kr = mach_msg(&note.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT | MACH_RCV_LARGE, 0, sizeof note, last,
+                              2000, MACH_PORT_NULL);
+  CHECK(kr == KERN_SUCCESS || kr == MACH_RCV_TOO_LARGE, "producer handled the messages and released their replies");
+  if (kr == KERN_SUCCESS) mach_msg_destroy(&note.header);
+
+  for (NSNumber *n in ports) mach_port_mod_refs(mach_task_self(), n.unsignedIntValue, MACH_PORT_RIGHT_RECEIVE, -1);
+  int leaked = dead_names() - deadBefore;
+  CHECK(leaked <= 0, "the producer keeps no rights from bad messages, kept %d of %d", leaked, ROUNDS * 5);
+  mach_port_deallocate(mach_task_self(), server);
+
+  Host *h = [Host new];
+  h.manual = YES;
+  CHECK(attach_host(local_ticket(l), h) == BOWSER_OK, "a real host still attaches");
+  IOSurfaceRef frame = make_iosurface();
+  CHECK(deliver(l, h, frame), "and still gets frames");
+  detach(h);
+  CFRelease(frame);
+  local_free(l);
+}
+
 int main(void) {
   @autoreleasepool {
     [NSApplication sharedApplication];
@@ -387,6 +838,16 @@ int main(void) {
         {"the host learns when the producer dies", test_host_learns_producer_died},
         {"the caret and cursor follow the producer", test_caret_follows_text},
         {"an IOSURFACE host shows the producer's pixels", test_iosurface_host_shows_producer_pixels},
+        {"a stopped producer never blocks the host", test_stalled_producer_never_blocks_the_host},
+        {"a failed attach leaves the current host attached", test_failed_attach_leaves_the_current_host},
+        {"the host drops a producer that stops reading", test_host_drops_a_producer_that_stops_reading},
+        {"a host's child process doesn't keep it attached", test_host_children_dont_keep_it_attached},
+        {"a producer's child process doesn't hide its death", test_producer_children_dont_hide_its_death},
+        {"an expired ticket is refused", test_expired_ticket_is_refused},
+        {"oversize text is refused, not fatal", test_oversize_text_is_refused_not_fatal},
+        {"detaching in a callback ends the callbacks", test_detach_in_a_callback_ends_callbacks},
+        {"a host keeps its frames in use until replaced", test_host_keeps_its_frames_in_use},
+        {"the frame service survives hostile messages", test_frame_service_survives_hostile_messages},
     };
     int failed = 0;
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
