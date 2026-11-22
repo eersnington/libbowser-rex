@@ -1,0 +1,72 @@
+// Control channel between a producer and a host: framed messages over a Unix
+// stream socket. Frames are a u32 payload length, a u16 type, then the payload.
+// Numbers are little-endian. Strings are a u32 length, then UTF-8 bytes.
+#ifndef BOWSER_WIRE_H
+#define BOWSER_WIRE_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#define BW_TICKET_PREFIX "bowser1:"
+#define BW_TOKEN_LEN 32
+#define BW_MAX_FRAME (1u << 20)
+
+typedef enum {
+  // host -> producer
+  BW_MSG_HELLO = 1, // str token
+  BW_MSG_RESIZE,    // f64 w, h, scale
+  BW_MSG_FOCUS,     // u8
+  BW_MSG_KEY,       // u32 action, u32 keycode, u64 mods, str text, str unmodified
+  BW_MSG_MOUSE,     // u32 action, i32 button, f64 x, y, i32 clicks, u64 mods
+  BW_MSG_SCROLL,    // f64 dx, dy, u8 precise, i32 phase, i32 momentum, f64 x, y, u64 mods
+  BW_MSG_TEXT,      // u32 kind, str text, i64 sel loc, len, i64 repl loc, len
+  // producer -> host
+  BW_MSG_WELCOME = 100, // u32 transport, u32 context id, f64 w, h, scale, str mach service, u64 nonce
+  BW_MSG_REJECT,        // u32 bowser_result_e
+  BW_MSG_DETACH,        // u32 bowser_result_e
+  BW_MSG_CARET,         // f64 x, y, w, h
+  BW_MSG_COMPOSITION,   // u8 active, u32 count, count * (f64 x, y, w, h)
+  BW_MSG_CURSOR,        // u32 bowser_cursor_e
+} bw_msg_type;
+
+typedef struct {
+  uint8_t *data;
+  size_t len, cap;
+} bw_buf;
+
+void bw_buf_free(bw_buf *);
+void bw_put_u8(bw_buf *, uint8_t);
+void bw_put_u32(bw_buf *, uint32_t);
+void bw_put_i32(bw_buf *, int32_t);
+void bw_put_u64(bw_buf *, uint64_t);
+void bw_put_i64(bw_buf *, int64_t);
+void bw_put_f64(bw_buf *, double);
+void bw_put_str(bw_buf *, const char *); // NULL is written as an empty string
+
+typedef struct {
+  const uint8_t *p;
+  size_t left;
+  bool err;
+} bw_rd;
+
+uint8_t bw_get_u8(bw_rd *);
+uint32_t bw_get_u32(bw_rd *);
+int32_t bw_get_i32(bw_rd *);
+uint64_t bw_get_u64(bw_rd *);
+int64_t bw_get_i64(bw_rd *);
+double bw_get_f64(bw_rd *);
+char *bw_get_str(bw_rd *); // malloc'd, NUL-terminated; free it
+
+// Write one whole frame. Returns false if the socket failed.
+bool bw_send(int fd, uint16_t type, const bw_buf *payload);
+
+// Read whatever is available into acc. Returns false on EOF or error.
+bool bw_recv_some(int fd, bw_buf *acc);
+// Pop one complete frame from acc. Returns false if none is complete yet.
+// Sets *bad if the stream is corrupt.
+bool bw_next_frame(bw_buf *acc, uint16_t *type, bw_buf *payload, bool *bad);
+// Block until one whole frame arrives (used for the handshake).
+bool bw_recv_frame_blocking(int fd, bw_buf *acc, uint16_t *type, bw_buf *payload);
+
+#endif
