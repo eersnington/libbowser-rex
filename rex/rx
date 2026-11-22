@@ -1,0 +1,6 @@
+#!/bin/sh
+# The rex CLI, pinned to the dev server from dev-server.sh. It never autostarts a server.
+D=$(cd "$(dirname "$0")" && pwd)/dev
+exec env -u REX_SERVER -u REX_SESSION -u REX_BLOCK -u REX_CLIENT HOME="$D/home" REX_CONFIG="$D/init.lua" \
+  sandbox-exec -D HOME="$HOME" -f "$(dirname "$D")/sandbox.sb" \
+  rex --autostart=false -S "unix://$D/server.sock" "$@"
