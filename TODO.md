@@ -30,12 +30,42 @@ Measured on an M4 MacBook Air (60 Hz), macOS 27.2, about 19,200 frames each:
 
 Pacing is measured at the producer's display link, not on screen.
 
-## Step 2: engine (next)
+## Step 2: engine
 
-- [ ] `adapters/cef`: CEF off-screen rendering with shared textures, behind the IOSURFACE transport
-- [ ] CALAYERHOST for CEF: CEF hands out an IOSurface, so it needs a layer with IOSurface contents committed in the producer's `CAContext`
-- [ ] Load a real page; forward mouse, scroll, and keys
-- [ ] Resize without stretched or blank frames
+CEF 158.0.3 (Chromium 158.0.8127.18), C API, sandboxed helpers.
+`scripts/fetch-cef.sh` pins and verifies it; `make cef`, `make test-cef`,
+`scripts/demo-cef.sh`, `scripts/bench-cef.sh`.
+
+- [x] `adapters/cef`: CEF off-screen rendering with shared textures, behind the IOSURFACE transport
+- [x] CALAYERHOST for CEF: each frame is a layer's IOSurface contents in the producer's `CAContext`
+- [x] Load a real page; forward mouse, scroll (with trackpad phases), and keys
+- [x] Resize without stretched frames (a frame always shows at its own size)
+- [ ] Resize without blank frames: while the host grows, a strip of host background shows until the new-size frame arrives (12-18 ms). Needs a resize fence between host and producer.
+- [ ] 120 fps: not measurable on this 60 Hz machine
+
+CEF lends its IOSurface only for the length of `on_accelerated_paint` and
+reuses it from a pool of 2-3. The adapter copies each frame (Metal blit) into
+a pool of its own, reused least-recently-shown first and only when
+`IOSurfaceIsInUse()` is false, and waits for the copy before returning.
+
+Measured with `scripts/bench-cef.sh` on Wikipedia's "Chromium (web browser)",
+800x600 pt at 2x, 10 s of synthesized trackpad scrolling, on an M4 MacBook Air
+(60 Hz) with other apps running. Frame stats are 2 s windows at the producer's
+paint callback; CPU is `ps` CPU time over the scroll, as % of one core.
+
+| | CALAYERHOST | IOSURFACE |
+|---|---|---|
+| Frame rate while scrolling | 59.7-60.3 fps | 59.4-60.1 fps |
+| Late frames (> 25 ms gap) | 0-4 per 120 | 0-5 per 120 |
+| Frame-interval jitter (RMS) | 1.7-4.3 ms | 3.7-4.3 ms |
+| Copy, wall (GPU) | 1.0-2.2 ms (0.4-1.5 ms) | 1.0-3.6 ms (0.3-2.6 ms) |
+| Browser / GPU / renderer CPU | 6% / 7% / 6% | 5% / 6-7% / 5-6% |
+| Host CPU | 0.3-0.6% | 1.3-1.5% |
+| Resize to new-size frame | 13-18 ms | 12-15 ms |
+
+- Live resize of this page runs at 21-40 fps: Chromium relayout, not the pipe.
+- `external_begin_frame_enabled` (frames driven by the display link) measured
+  worse jitter (2-4 ms against 2 ms), so CEF keeps its own timer.
 
 ## Step 3: text input
 
@@ -61,3 +91,9 @@ Pacing is measured at the producer's display link, not on screen.
 - A connection that sends HELLO but never READY holds a socket until it closes. The uid check limits this to the producer's own user.
 - `bowser_host_attach` blocks the calling thread for up to 3 s when the producer is stopped or busy.
 - Moving test windows to a Space uses private CGS calls (`BOWSER_SPACE`).
+- CEF: `<select>` popups (`PET_POPUP`) aren't composited.
+- CEF: menus, JS dialogs, file pickers, and new windows are suppressed (links open in place). The ABI has no way to hand them to the host.
+- CEF: the host's screen position isn't in the ABI, so CEF gets view coordinates as screen coordinates.
+- CEF: caret rects arrive only during an IME composition (`on_ime_composition_range_changed`), not for a plain caret.
+- CEF: AppKit commands (`doCommandBySelector:`, such as emacs bindings) don't reach the producer. Return, Tab, Escape, and Control/Command chords are sent as CHAR events instead.
+- CEF: one profile per process in `$TMPDIR`, removed on a clean exit. Nothing persists.
