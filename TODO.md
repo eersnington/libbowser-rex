@@ -72,9 +72,16 @@ paint callback; CPU is `ps` CPU time over the scroll, as % of one core.
 - [ ] Japanese IME in the Swift host against CEF
 - [ ] Press-and-hold accents, emoji picker
 
-## Rex
+## Rex ✅ (dev harness)
 
-- [ ] Find how a Rex block could mount `bowser_host_layer()` (creator API, client internals)
+- [x] Server: `dev.libbowser` block plugin (`rex/plugin`, Go, stdlib only), reverse-engineered protocol in `rex/PROTOCOL.md`
+- [x] Client: injected dev copy of Rex mounts surfaces in `dev.libbowser.browser` panes (`rex-client/`)
+- [x] End to end in a real Rex window: block → plugin-started producer → ticket via `block call` → CALAYERHOST in the pane, 60 fps
+- [x] Isolation: dev server and client run in a kernel sandbox, fake HOME (server), own bundle ID (client), Space 3, no activation
+- [ ] Producers mint tickets on request (stdin `ticket` line) instead of a batch of 16
+- [ ] Pane focus: clicking a bowser pane should also move Rex's focus to that block
+- [ ] One dev harness: `rex/dev-server.sh` and `rex-client/run.sh` overlap; keep `rex-client/run.sh`
+- [ ] Share the host view between `examples/host-swift` and `rex-client/RexBowser.swift`
 
 ## Proposals
 
