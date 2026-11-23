@@ -9,7 +9,8 @@ transport="${1:-calayerhost}"
 url="${2:-https://en.wikipedia.org/wiki/Chromium_(web_browser)}"
 [ $# -ge 2 ] && shift 2 || shift $#
 out="$(mktemp -d)"
-build/bowser-cef.app/Contents/MacOS/bowser-cef --transport "$transport" --url "$url" "$@" \
+# A fresh profile, so every run starts with a cold cache.
+build/bowser-cef.app/Contents/MacOS/bowser-cef --profile "$out/profile" --transport "$transport" --url "$url" "$@" \
   > "$out/producer.out" 2> "$out/producer.err" &
 producer=$!
 bench=

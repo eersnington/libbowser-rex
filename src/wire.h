@@ -23,6 +23,7 @@ typedef enum {
   BW_MSG_SCROLL,    // f64 dx, dy, u8 precise, i32 phase, i32 momentum, f64 x, y, u64 mods, u64 timestamp
   BW_MSG_TEXT,      // u32 kind, str text, i64 sel loc, len, i64 repl loc, len
   BW_MSG_READY,     // empty; the host is set up, so the producer commits the attach
+  BW_MSG_MESSAGE,   // str name, u8 has body, str body (BOWSER_MESSAGE_MAX); input, so it keeps its place
   // producer -> host
   BW_MSG_WELCOME = 100, // u32 transport, u32 context id, f64 w, h, scale, str mach service, u64 nonce
   BW_MSG_REJECT,        // u32 bowser_result_e
@@ -30,6 +31,7 @@ typedef enum {
   BW_MSG_CARET,         // f64 x, y, w, h
   BW_MSG_COMPOSITION,   // u8 active, u32 count, count * (f64 x, y, w, h)
   BW_MSG_CURSOR,        // u32 bowser_cursor_e
+  BW_MSG_PRODUCER_MESSAGE, // as BW_MSG_MESSAGE
 } bw_msg_type;
 
 typedef struct {

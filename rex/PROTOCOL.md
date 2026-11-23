@@ -165,7 +165,7 @@ Types seen: `session_attached`, `focus` (`{"action":"in"}`), `session_view_chang
 
 ```json
 ← {"block_id":"<hosted>","method":"ticket","args":{}}
-→ {"ticket":"bowser2:…","remaining":15}
+→ {"ticket":"bowser2:…"}
 ```
 
 `args` is `{}` when the caller gives none. **Rex does not check `args` against `input_schema`** (`{"x":1}` reached the plugin). **Verified.** It is not known whether Rex checks the output against `output_schema`.
@@ -197,7 +197,20 @@ On SIGTERM, the server sends `block.snapshot` (with `--restore` only), then `blo
 
 When the server is SIGKILLed, the plugin is reparented and gets nothing. Our plugin polls `getppid()` and cleans up. **Verified**
 
-## 6. Isolation pitfalls
+## 6. Calling the server from a plugin
+
+A plugin can call the server's API like the CLI does. Our plugin uses it to set block labels. **Verified** against server build 2061:
+
+1. Find the socket. The server writes `$HOME/Library/Application Support/rex/servers/<hash>/runtime.json`, `{"endpoint":"unix:///…/s.sock","pid":…,…}`. Pick the one whose `pid` is our parent's. Don't trust `REX_SERVER`: see section 7.
+2. Connect and check the socket's peer pid (`LOCAL_PEERPID`) is our parent's.
+3. `GET /api/control` with `Sec-WebSocket-Protocol: rex.control.v1`. The client masks its frames, per RFC 6455.
+4. Send `{"type":"hello","api_revision":18}`. The server answers `welcome`.
+5. Call `session.attach {"session_id"}` first. Without it, `session.set_block_label` fails with `stream is not attached to session …` (`bad_request`).
+6. `session.set_block_label {"session_id","block_id","label"}`. `block_id` is the **session** block ID from `block.create`, not the hosted one. Labels are trimmed, and at most 128 characters with no control characters.
+
+An attached connection receives the session's events. A plugin that doesn't read them should close the connection after each call, as the CLI does; each connection shows up as `client_connected`/`client_disconnected` in the session.
+
+## 7. Isolation pitfalls
 
 - `--state-dir` does not cover everything. A dev server made `~/Library/Application Support/rex/servers/<hash of the socket path>/` (with `runtime.json` and `start.lock`) in the real Rex state. Run dev servers with a fake `HOME`. **Verified**
 - A shell inside a Rex terminal has `REX_SERVER`, `REX_SESSION` and `REX_BLOCK` for the real server. Plugins inherit them, and the `rex` CLI uses `REX_BLOCK` as its default target. Unset them. **Verified**

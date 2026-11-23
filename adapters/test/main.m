@@ -10,6 +10,10 @@
 // Prints N tickets per surface, one per line, surface by surface, then runs
 // until killed. --surfaces adds scene-less surfaces; --echo prints events;
 // --spawn starts `sleep 5` on each attach, like an engine starting a helper.
+//
+// Messages: it sends `hello` on attach and tries `missed` on detach (no host
+// gets it). It answers `ping BODY` with `pong BODY`, and `grow N` with a
+// `grown` message of N bytes. --echo prints each send that fails.
 #import <AppKit/AppKit.h>
 #import <CoreText/CoreText.h>
 #import <Metal/Metal.h>
@@ -368,8 +372,26 @@ static void on_resize(void *ud, bowser_surface_t *s, bowser_size_s size) {
   [scene layout];
 }
 static void on_focus(void *ud, bowser_surface_t *s, bool focused) { say(s, @"focus %d", focused); }
+static void send_message(bowser_surface_t *s, const char *name, const char *body) {
+  bowser_result_e rc = bowser_surface_send(s, name, body);
+  if (rc != BOWSER_OK) say(s, @"send %s failed %d", name, rc);
+}
+static void on_message(void *ud, bowser_surface_t *s, const char *name, const char *body) {
+  say(s, @"message %s %s", name, body ? body : "(null)");
+  if (!strcmp(name, "ping")) {
+    send_message(s, "pong", body);
+  } else if (!strcmp(name, "grow") && body) {
+    size_t n = strtoul(body, NULL, 10);
+    char *big = malloc(n + 1);
+    memset(big, 'x', n);
+    big[n] = 0;
+    send_message(s, "grown", big);
+    free(big);
+  }
+}
 static void on_attach(void *ud, bowser_surface_t *s, bool attached) {
   say(s, @"%@", attached ? @"attached" : @"detached");
+  send_message(s, attached ? "hello" : "missed", NULL);
   if (!echo) fprintf(stderr, "host %s\n", attached ? "attached" : "detached");
   if (attached && is_scene(s)) [scene renderText]; // send the caret to the new host
   if (attached && spawn) {
@@ -412,6 +434,7 @@ int main(int argc, char **argv) {
         .resize_cb = on_resize,
         .focus_cb = on_focus,
         .attach_cb = on_attach,
+        .message_cb = on_message,
     };
     bowser_producer_t *producer;
     if (bowser_producer_new(&cfg, &producer) != BOWSER_OK) {

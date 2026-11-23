@@ -108,6 +108,8 @@ typedef enum {
   BOWSER_CURSOR_RESIZE_UP_DOWN,
 } bowser_cursor_e;
 
+#define BOWSER_MESSAGE_MAX (64 * 1024)
+
 // ---- Conventions ----------------------------------------------------
 //
 // Threading: each producer or host belongs to one thread, the embedder's.
@@ -133,6 +135,16 @@ typedef enum {
 // Config structs start with a size field and only grow at the end. Pass
 // sizeof your struct. The library accepts any size from the *_MIN_SIZE
 // constant up and zero-fills the fields a smaller struct lacks.
+//
+// Messages: small named messages between a surface's producer and its host,
+// for everything that isn't pixels or input: navigation, titles, edit
+// commands. `name` is a short ASCII identifier (1-64 of [A-Za-z0-9_.-]);
+// `body` is UTF-8 (JSON by convention) or NULL, at most BOWSER_MESSAGE_MAX
+// bytes. Each direction is delivered in order, and host messages keep their
+// place among the host's input: never coalesced, never reordered against key
+// or text. A bad name or an oversize body is refused with BOWSER_ERR_INVALID
+// at the call; the connection stays up. Nothing is buffered for a host that
+// isn't attached, so a producer sends its current state from attach_cb.
 
 uint32_t bowser_abi_version(void);
 // The message for the latest failed call on the calling thread, or "".
@@ -163,9 +175,11 @@ typedef struct {
   void (*resize_cb)(void *ud, bowser_surface_t *, bowser_size_s);
   void (*focus_cb)(void *ud, bowser_surface_t *, bool focused);
   void (*attach_cb)(void *ud, bowser_surface_t *, bool attached);
+  void (*message_cb)(void *ud, bowser_surface_t *, const char *name, const char *body);
 } bowser_producer_config_s;
 
-// In 0.x the minimum is the whole struct. From 1.0 it is frozen at the 1.0 layout.
+// Ends at attach_cb, the last field before message_cb was added, so callers
+// built before it still work. From 1.0 it is frozen at the 1.0 layout.
 #define BOWSER_PRODUCER_CONFIG_MIN_SIZE \
   (offsetof(bowser_producer_config_s, attach_cb) + sizeof(((bowser_producer_config_s *)0)->attach_cb))
 
@@ -197,6 +211,10 @@ bowser_result_e bowser_surface_set_composition(bowser_surface_t *, bool active, 
                                                size_t count);
 bowser_result_e bowser_surface_set_cursor(bowser_surface_t *, bowser_cursor_e);
 
+// A message to the attached host. See "Messages". BOWSER_ERR_DISCONNECTED
+// when no host is attached: it isn't kept for the next one.
+bowser_result_e bowser_surface_send(bowser_surface_t *, const char *name, const char *body);
+
 // ---- Host side ------------------------------------------------------
 //
 // bowser_host_attach blocks for at most 3 s. bowser_host_detach frees the
@@ -215,9 +233,11 @@ typedef struct {
                          size_t count);
   void (*cursor_cb)(void *ud, bowser_host_t *, bowser_cursor_e);
   void (*detached_cb)(void *ud, bowser_host_t *, bowser_result_e why);
+  void (*message_cb)(void *ud, bowser_host_t *, const char *name, const char *body);
 } bowser_host_config_s;
 
-// In 0.x the minimum is the whole struct. From 1.0 it is frozen at the 1.0 layout.
+// Ends at detached_cb, the last field before message_cb was added, so callers
+// built before it still work. From 1.0 it is frozen at the 1.0 layout.
 #define BOWSER_HOST_CONFIG_MIN_SIZE \
   (offsetof(bowser_host_config_s, detached_cb) + sizeof(((bowser_host_config_s *)0)->detached_cb))
 
@@ -236,6 +256,8 @@ bowser_result_e bowser_host_key(bowser_host_t *, const bowser_key_s *);
 bowser_result_e bowser_host_mouse(bowser_host_t *, const bowser_mouse_s *);
 bowser_result_e bowser_host_scroll(bowser_host_t *, const bowser_scroll_s *);
 bowser_result_e bowser_host_text(bowser_host_t *, const bowser_text_s *);
+// A message to the producer, in order with the input above. See "Messages".
+bowser_result_e bowser_host_send(bowser_host_t *, const char *name, const char *body);
 
 #ifdef __cplusplus
 }

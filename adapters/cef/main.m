@@ -1,4 +1,6 @@
-// bowser-cef: a producer that shows a CEF browser through libbowser.
+// bowser-cef: one CEF engine that serves many libbowser surfaces, one browser
+// per surface. All of them share a profile, so logins persist, and share
+// CEF's GPU, network, and storage processes.
 //
 // CEF renders off screen with shared textures: its GPU process draws each
 // frame into an IOSurface from its own pool and lends it to us for the length
@@ -6,8 +8,13 @@
 // then show that copy with the surface's transport: as layer contents in our
 // CAContext on CALAYERHOST, or with bowser_surface_present on IOSURFACE.
 //
-// Usage: bowser-cef [--transport calayerhost|iosurface] [--url URL] [--tickets N]
-// Prints N tickets, one per line, then runs until SIGTERM or SIGINT.
+// Usage:
+//   bowser-cef [--profile DIR]
+//       Control mode: JSON lines on stdin and stdout (see README.md). Exits
+//       when stdin closes.
+//   bowser-cef [--profile DIR] [--transport T] [--url URL] [--tickets N]
+//       One tab: prints N tickets (default 1), one per line, then runs until
+//       SIGTERM or SIGINT. For tests, demos, and benchmarks.
 //
 // CEF paces frames with its own timer. Driving it from the display link
 // (external_begin_frame_enabled) measured no better: frame-interval jitter
@@ -16,6 +23,8 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdatomic.h>
 
 #include "bowser.h"
@@ -26,21 +35,23 @@
 #include "include/capi/cef_context_menu_handler_capi.h"
 #include "include/capi/cef_dialog_handler_capi.h"
 #include "include/capi/cef_display_handler_capi.h"
+#include "include/capi/cef_find_handler_capi.h"
 #include "include/capi/cef_input_event_utils_capi.h"
 #include "include/capi/cef_jsdialog_handler_capi.h"
 #include "include/capi/cef_life_span_handler_capi.h"
+#include "include/capi/cef_load_handler_capi.h"
 #include "include/capi/cef_render_handler_capi.h"
 #include "include/cef_api_hash.h"
 #include "include/cef_application_mac.h"
 
-// Copies of CEF frames we keep. The host shows one, the next is in flight, and
-// the rest let us skip any the window server still reads.
-enum { kPoolMax = 6 };
+// Copies of CEF frames a tab keeps. The host shows one, the next is in
+// flight, and the rest let us skip any the window server still reads.
+enum { kViewPoolMax = 6, kPopupPoolMax = 3 };
 
 // ---- CEF plumbing ---------------------------------------------------
 
-// Every handler below is a static object that lives as long as the process,
-// so its reference count has nothing to track.
+// The handlers are static objects that live as long as the process, so their
+// reference counts have nothing to track. Only the per-tab client counts.
 static void CEF_CALLBACK static_add_ref(cef_base_ref_counted_t *self) {}
 static int CEF_CALLBACK static_release(cef_base_ref_counted_t *self) { return 0; }
 static int CEF_CALLBACK static_has_one_ref(cef_base_ref_counted_t *self) { return 0; }
@@ -50,7 +61,7 @@ static int CEF_CALLBACK static_has_ref(cef_base_ref_counted_t *self) { return 1;
            .has_one_ref = static_has_one_ref, .has_at_least_one_ref = static_has_ref}
 
 // CEF hands each struct argument and return value over with a reference the
-// receiver must drop.
+// receiver must drop, and takes one with each struct we pass it.
 static void unref(void *object) {
   cef_base_ref_counted_t *base = object;
   if (base) base->release(base);
@@ -61,6 +72,11 @@ static cef_string_t cef_str(const char *utf8) {
   cef_string_t s = {0};
   cef_string_utf8_to_utf16(utf8, strlen(utf8), &s);
   return s;
+}
+
+static NSString *ns_str(const cef_string_t *s) {
+  if (!s || !s->str) return @"";
+  return [NSString stringWithCharacters:(const unichar *)s->str length:s->length];
 }
 
 // ---- State ----------------------------------------------------------
@@ -76,25 +92,32 @@ static cef_string_t cef_str(const char *utf8) {
 - (void)dealloc { CFRelease(surface); }
 @end
 
-static struct {
-  bowser_producer_t *producer;
-  bowser_surface_t *surface;
+@interface Tab : NSObject {
+@public
+  NSString *sid;
   bowser_transport_e transport;
+  bowser_surface_t *surface; // NULL once closed
   bowser_size_s size;
-  const char *url;
   bool attached;
+  NSString *startURL;
+  bool started; // CEF is making, or has made, the browser
 
   cef_browser_t *browser;
   cef_browser_host_t *host;
 
   // Frames
-  id<MTLDevice> device;
-  id<MTLCommandQueue> queue;
   NSMutableArray<Buffer *> *pool;
   Buffer *last;     // the newest frame, re-shown to a host that attaches
   CALayer *content; // CALAYERHOST: shows `last`
   uint64_t frameNo;
   bool repaintQueued;
+
+  // <select> and other popup widgets: a separate paint, composited over the view
+  NSMutableArray<Buffer *> *popupPool;
+  Buffer *popup; // newest popup paint, while shown
+  bool popupShown;
+  cef_rect_t popupRect; // view coordinates, inside the view
+  CALayer *popupLayer;  // CALAYERHOST: shows `popup`
 
   // Input
   bool composing;
@@ -102,12 +125,95 @@ static struct {
   uint32_t heldButtons;                  // CEF_EVENTFLAG_*_MOUSE_BUTTON
   bowser_cursor_e cursor;
 
+  // Navigation state, sent to the host and the controller
+  NSString *url, *title;
+  bool loading, canGoBack, canGoForward;
+  double progress;
+  CFTimeInterval stateSentAt;
+  bool stateQueued;
+  NSString *findText;
+  int findCount, findActive;
+
   // Stats, printed every 2 s while frames arrive
   CFTimeInterval windowStart, lastPaint, resizeAt;
   int frames, late;
   double maxGapMs, jitter2, copyMs, copyMaxMs, gpuMs, resizeMaxMs;
   NSMutableSet<NSNumber *> *sources;
-} g;
+}
+@end
+@implementation Tab
+@end
+
+static struct {
+  bool control;      // JSON lines on stdin/stdout
+  bool contextReady; // CEF can create browsers
+  bool quitting;
+  bowser_producer_t *producers[2]; // by transport, made on first use
+  NSMutableDictionary<NSString *, Tab *> *tabs;
+  NSMutableDictionary<NSValue *, Tab *> *bySurface;
+  NSMutableArray<Tab *> *pending; // opened before the context was ready
+  unsigned nextId;
+  id<MTLDevice> device;
+  id<MTLCommandQueue> queue;
+  dispatch_source_t input;
+  NSMutableData *line;
+} E;
+
+static Tab *tab_for_surface(bowser_surface_t *s) { return E.bySurface[[NSValue valueWithPointer:s]]; }
+
+// ---- Control channel ------------------------------------------------
+
+static void emit(NSDictionary *object) {
+  if (!E.control) return;
+  NSData *d = [NSJSONSerialization dataWithJSONObject:object options:NSJSONWritingWithoutEscapingSlashes error:nil];
+  fwrite(d.bytes, 1, d.length, stdout);
+  fputc('\n', stdout);
+  fflush(stdout);
+}
+
+static NSString *json_text(NSDictionary *object) {
+  NSData *d = [NSJSONSerialization dataWithJSONObject:object options:NSJSONWritingWithoutEscapingSlashes error:nil];
+  return [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+}
+
+// A message to the tab's host, if one is attached, and to the controller.
+static void publish(Tab *t, NSString *name, NSDictionary *body) {
+  if (t->attached && t->surface) bowser_surface_send(t->surface, name.UTF8String, json_text(body).UTF8String);
+  NSMutableDictionary *event = [body mutableCopy];
+  event[@"event"] = name;
+  event[@"surface"] = t->sid;
+  emit(event);
+}
+
+static NSDictionary *state_of(Tab *t) {
+  return @{
+    @"url" : t->url ?: @"",
+    @"title" : t->title ?: @"",
+    @"loading" : @(t->loading),
+    @"progress" : @(t->progress),
+    @"can_go_back" : @(t->canGoBack),
+    @"can_go_forward" : @(t->canGoForward),
+  };
+}
+
+static void send_state(Tab *t) {
+  t->stateSentAt = CACurrentMediaTime();
+  publish(t, @"state", state_of(t));
+}
+
+// Loading changes the state many times a frame; send at most one per frame,
+// the first at once and the newest at the end.
+static void state_changed(Tab *t) {
+  if (t->stateQueued) return;
+  double frame = 1.0 / fmax(1, NSScreen.mainScreen.maximumFramesPerSecond);
+  double wait = t->stateSentAt + frame - CACurrentMediaTime();
+  if (wait <= 0) return send_state(t);
+  t->stateQueued = true;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    t->stateQueued = false;
+    if (t->surface) send_state(t);
+  });
+}
 
 // ---- Frames ---------------------------------------------------------
 
@@ -126,23 +232,25 @@ static id<MTLTexture> texture_for(IOSurfaceRef s, MTLTextureUsage usage) {
                                                                               height:IOSurfaceGetHeight(s)
                                                                            mipmapped:NO];
   d.usage = usage;
-  return [g.device newTextureWithDescriptor:d iosurface:s plane:0];
+  return [E.device newTextureWithDescriptor:d iosurface:s plane:0];
 }
 
-// A buffer shaped like `src` that no one is reading: neither the window server
-// nor the host. Least recently shown first, so a frame the host hasn't picked
-// up yet isn't overwritten.
-static Buffer *take_buffer(IOSurfaceRef src) {
-  size_t w = IOSurfaceGetWidth(src), h = IOSurfaceGetHeight(src);
-  OSType format = IOSurfaceGetPixelFormat(src);
-  [g.pool filterUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(Buffer *b, NSDictionary *_) {
-            return IOSurfaceGetWidth(b->surface) == w && IOSurfaceGetHeight(b->surface) == h &&
-                   IOSurfaceGetPixelFormat(b->surface) == format;
-          }]];
+// A buffer shaped like `like` that no one is reading: neither the window
+// server nor the host. Least recently shown first, so a frame the host hasn't
+// picked up yet isn't overwritten. `keep` is never returned.
+static Buffer *take_buffer(NSMutableArray<Buffer *> *pool, int max, IOSurfaceRef like, Buffer *keep) {
+  size_t w = IOSurfaceGetWidth(like), h = IOSurfaceGetHeight(like);
+  OSType format = IOSurfaceGetPixelFormat(like);
+  [pool filterUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(Buffer *b, NSDictionary *_) {
+          return b == keep || (IOSurfaceGetWidth(b->surface) == w && IOSurfaceGetHeight(b->surface) == h &&
+                               IOSurfaceGetPixelFormat(b->surface) == format);
+        }]];
   Buffer *best = nil;
-  for (Buffer *b in g.pool)
-    if (!IOSurfaceIsInUse(b->surface) && b != g.last && (!best || b->shownAt < best->shownAt)) best = b;
-  if (best || g.pool.count >= kPoolMax) return best;
+  for (Buffer *b in pool)
+    if (b != keep && IOSurfaceGetWidth(b->surface) == w && IOSurfaceGetHeight(b->surface) == h &&
+        !IOSurfaceIsInUse(b->surface) && (!best || b->shownAt < best->shownAt))
+      best = b;
+  if (best || (int)pool.count >= max) return best;
 
   Buffer *b = [Buffer new];
   b->surface = IOSurfaceCreate((__bridge CFDictionaryRef) @{
@@ -151,131 +259,258 @@ static Buffer *take_buffer(IOSurfaceRef src) {
     (id)kIOSurfaceBytesPerElement : @4,
     (id)kIOSurfacePixelFormat : @(format),
   });
-  CFTypeRef cs = IOSurfaceCopyValue(src, kIOSurfaceColorSpace);
+  CFTypeRef cs = IOSurfaceCopyValue(like, kIOSurfaceColorSpace);
   if (cs) {
     IOSurfaceSetValue(b->surface, kIOSurfaceColorSpace, cs);
     CFRelease(cs);
   }
-  b->texture = texture_for(b->surface, MTLTextureUsageShaderWrite);
-  [g.pool addObject:b];
+  b->texture = texture_for(b->surface, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+  [pool addObject:b];
   return b;
+}
+
+// Copy all of src into dst with its top-left corner at (x, y) pixels, clipped.
+static void blit(id<MTLBlitCommandEncoder> enc, id<MTLTexture> src, id<MTLTexture> dst, long x, long y) {
+  long sx = x < 0 ? -x : 0, sy = y < 0 ? -y : 0;
+  long dx = x < 0 ? 0 : x, dy = y < 0 ? 0 : y;
+  long w = MIN((long)src.width - sx, (long)dst.width - dx), h = MIN((long)src.height - sy, (long)dst.height - dy);
+  if (w <= 0 || h <= 0) return;
+  [enc copyFromTexture:src
+           sourceSlice:0
+           sourceLevel:0
+          sourceOrigin:MTLOriginMake(sx, sy, 0)
+            sourceSize:MTLSizeMake(w, h, 1)
+             toTexture:dst
+      destinationSlice:0
+      destinationLevel:0
+     destinationOrigin:MTLOriginMake(dx, dy, 0)];
 }
 
 // Ask CEF for a fresh frame soon. Used when a frame couldn't reach the host:
 // a page that has stopped changing would otherwise never send a newer one.
-static void request_repaint(void) {
-  if (g.repaintQueued) return;
-  g.repaintQueued = true;
+static void request_repaint(Tab *t) {
+  if (t->repaintQueued) return;
+  t->repaintQueued = true;
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-    g.repaintQueued = false;
-    if (g.host && g.attached) g.host->invalidate(g.host, PET_VIEW);
+    t->repaintQueued = false;
+    if (t->host && t->attached) t->host->invalidate(t->host, PET_VIEW);
   });
 }
 
-static void show(Buffer *b) {
-  double scale = g.size.scale;
-  if (g.transport == BOWSER_TRANSPORT_CALAYERHOST) {
+static void show(Tab *t, Buffer *b) {
+  double scale = t->size.scale;
+  if (t->transport == BOWSER_TRANSPORT_CALAYERHOST) {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    g.content.contents = (__bridge id)b->surface;
-    g.content.contentsScale = scale;
+    t->content.contents = (__bridge id)b->surface;
+    t->content.contentsScale = scale;
     // At the frame's own size, so a resize never stretches an old frame.
-    g.content.frame = CGRectMake(0, 0, IOSurfaceGetWidth(b->surface) / scale, IOSurfaceGetHeight(b->surface) / scale);
+    t->content.frame =
+        CGRectMake(0, 0, IOSurfaceGetWidth(b->surface) / scale, IOSurfaceGetHeight(b->surface) / scale);
     [CATransaction commit];
-  } else if (g.attached) {
-    bowser_size_s sz = g.size;
-    if (bowser_surface_present(g.surface, b->surface, (bowser_rect_s){0, 0, sz.width, sz.height}) != BOWSER_OK)
-      request_repaint();
+  } else if (t->attached) {
+    bowser_size_s sz = t->size;
+    if (bowser_surface_present(t->surface, b->surface, (bowser_rect_s){0, 0, sz.width, sz.height}) != BOWSER_OK)
+      request_repaint(t);
   }
-  b->shownAt = ++g.frameNo;
-  g.last = b;
+  b->shownAt = ++t->frameNo;
+  t->last = b;
 }
 
-static void count_frame(IOSurfaceRef src, double copyMs, double gpuMs) {
+static void count_frame(Tab *t, IOSurfaceRef src, double copyMs, double gpuMs) {
   CFTimeInterval now = CACurrentMediaTime();
   double budgetMs = 1000.0 / NSScreen.mainScreen.maximumFramesPerSecond;
-  if (g.lastPaint > 0 && now - g.lastPaint < 0.25) { // longer gaps are idle, not late
-    double gap = (now - g.lastPaint) * 1000;
-    if (gap > budgetMs * 1.5) g.late++;
-    g.maxGapMs = fmax(g.maxGapMs, gap);
-    g.jitter2 += (gap - budgetMs) * (gap - budgetMs);
+  if (t->lastPaint > 0 && now - t->lastPaint < 0.25) { // longer gaps are idle, not late
+    double gap = (now - t->lastPaint) * 1000;
+    if (gap > budgetMs * 1.5) t->late++;
+    t->maxGapMs = fmax(t->maxGapMs, gap);
+    t->jitter2 += (gap - budgetMs) * (gap - budgetMs);
   }
-  g.lastPaint = now;
-  g.frames++;
-  g.copyMs += copyMs;
-  g.copyMaxMs = fmax(g.copyMaxMs, copyMs);
-  g.gpuMs += gpuMs;
-  [g.sources addObject:@(IOSurfaceGetID(src))];
-  if (g.resizeAt > 0 && IOSurfaceGetWidth(src) == (size_t)lround(g.size.width * g.size.scale) &&
-      IOSurfaceGetHeight(src) == (size_t)lround(g.size.height * g.size.scale)) {
-    g.resizeMaxMs = fmax(g.resizeMaxMs, (now - g.resizeAt) * 1000);
-    g.resizeAt = 0;
+  t->lastPaint = now;
+  t->frames++;
+  t->copyMs += copyMs;
+  t->copyMaxMs = fmax(t->copyMaxMs, copyMs);
+  t->gpuMs += gpuMs;
+  [t->sources addObject:@(IOSurfaceGetID(src))];
+  if (t->resizeAt > 0 && IOSurfaceGetWidth(src) == (size_t)lround(t->size.width * t->size.scale) &&
+      IOSurfaceGetHeight(src) == (size_t)lround(t->size.height * t->size.scale)) {
+    t->resizeMaxMs = fmax(t->resizeMaxMs, (now - t->resizeAt) * 1000);
+    t->resizeAt = 0;
   }
-  if (g.windowStart == 0) g.windowStart = now;
-  if (now - g.windowStart < 2) return;
+  if (t->windowStart == 0) t->windowStart = now;
+  if (now - t->windowStart < 2) return;
   fprintf(stderr,
           "%s  %.1f fps  late %d  jitter %.1f ms  max gap %.1f ms  copy %.2f ms avg (gpu %.2f) %.2f max  "
-          "resize->frame %.0f ms  %lu cef surfaces\n",
-          g.transport == BOWSER_TRANSPORT_CALAYERHOST ? "calayerhost" : "iosurface", g.frames / (now - g.windowStart),
-          g.late, sqrt(g.jitter2 / g.frames), g.maxGapMs, g.copyMs / g.frames, g.gpuMs / g.frames, g.copyMaxMs,
-          g.resizeMaxMs, (unsigned long)g.sources.count);
-  g.windowStart = now;
-  g.frames = g.late = 0;
-  g.maxGapMs = g.jitter2 = g.copyMs = g.copyMaxMs = g.gpuMs = g.resizeMaxMs = 0;
-  [g.sources removeAllObjects];
+          "resize->frame %.0f ms  %lu cef surfaces  [%s]\n",
+          t->transport == BOWSER_TRANSPORT_CALAYERHOST ? "calayerhost" : "iosurface",
+          t->frames / (now - t->windowStart), t->late, sqrt(t->jitter2 / t->frames), t->maxGapMs,
+          t->copyMs / t->frames, t->gpuMs / t->frames, t->copyMaxMs, t->resizeMaxMs,
+          (unsigned long)t->sources.count, t->sid.UTF8String);
+  t->windowStart = now;
+  t->frames = t->late = 0;
+  t->maxGapMs = t->jitter2 = t->copyMs = t->copyMaxMs = t->gpuMs = t->resizeMaxMs = 0;
+  [t->sources removeAllObjects];
 }
 
-static void CEF_CALLBACK on_accelerated_paint(cef_render_handler_t *self, cef_browser_t *browser,
-                                              cef_paint_element_type_t type, size_t dirtyCount,
-                                              const cef_rect_t *dirty, const cef_accelerated_paint_info_t *info) {
-  unref(browser);
-  IOSurfaceRef src = info->shared_texture_io_surface;
-  if (type != PET_VIEW || !src) return; // popups (<select>) aren't composited yet
-  if (metal_format(IOSurfaceGetPixelFormat(src)) == MTLPixelFormatInvalid) {
-    fprintf(stderr, "bowser-cef: unsupported pixel format %#x\n", (unsigned)IOSurfaceGetPixelFormat(src));
-    return;
-  }
+// The popup's top-left corner in the view's pixels.
+static void popup_origin(Tab *t, long *x, long *y) {
+  *x = lround(t->popupRect.x * t->size.scale);
+  *y = lround(t->popupRect.y * t->size.scale);
+}
+
+// IOSURFACE has one image per frame, so a popup is drawn into it. CALAYERHOST
+// shows it as its own layer instead, and the window server composites.
+static bool composites_popup(Tab *t) {
+  return t->transport == BOWSER_TRANSPORT_IOSURFACE && t->popupShown && t->popup;
+}
+
+static void paint_view(Tab *t, IOSurfaceRef src) {
   CFTimeInterval start = CACurrentMediaTime();
-  Buffer *b = take_buffer(src);
+  Buffer *b = take_buffer(t->pool, kViewPoolMax, src, nil);
   if (!b) {
-    request_repaint(); // every copy is still on screen; try again next frame
+    request_repaint(t); // every copy is still on screen; try again next frame
     return;
   }
   // CEF reclaims `src` when this callback returns, so the copy must be
   // finished, not just queued, before we return.
-  id<MTLCommandBuffer> cb = [g.queue commandBuffer];
-  id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-  [blit copyFromTexture:texture_for(src, MTLTextureUsageShaderRead) toTexture:b->texture];
-  [blit endEncoding];
+  id<MTLCommandBuffer> cb = [E.queue commandBuffer];
+  id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
+  blit(enc, texture_for(src, MTLTextureUsageShaderRead), b->texture, 0, 0);
+  if (composites_popup(t)) {
+    long x, y;
+    popup_origin(t, &x, &y);
+    blit(enc, t->popup->texture, b->texture, x, y);
+  }
+  [enc endEncoding];
   [cb commit];
   [cb waitUntilCompleted];
   double copyMs = (CACurrentMediaTime() - start) * 1000;
-  show(b);
-  count_frame(src, copyMs, (cb.GPUEndTime - cb.GPUStartTime) * 1000);
+  show(t, b);
+  count_frame(t, src, copyMs, (cb.GPUEndTime - cb.GPUStartTime) * 1000);
+}
+
+static void place_popup_layer(Tab *t) {
+  if (!t->popupLayer) return;
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  bool visible = t->popupShown && t->popup;
+  t->popupLayer.hidden = !visible;
+  if (visible) {
+    double scale = t->size.scale;
+    t->popupLayer.contents = (__bridge id)t->popup->surface;
+    t->popupLayer.contentsScale = scale;
+    t->popupLayer.frame = CGRectMake(t->popupRect.x, t->popupRect.y, IOSurfaceGetWidth(t->popup->surface) / scale,
+                                     IOSurfaceGetHeight(t->popup->surface) / scale);
+  } else {
+    t->popupLayer.contents = nil;
+  }
+  [CATransaction commit];
+}
+
+static void paint_popup(Tab *t, IOSurfaceRef src) {
+  if (!t->popupShown) return;
+  Buffer *p = take_buffer(t->popupPool, kPopupPoolMax, src, nil);
+  if (!p) return;
+  id<MTLCommandBuffer> cb = [E.queue commandBuffer];
+  id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
+  blit(enc, texture_for(src, MTLTextureUsageShaderRead), p->texture, 0, 0);
+  // IOSURFACE: the popup changed but the view may not have, so redraw the
+  // newest frame with the new popup over it. The popup covers its old self:
+  // it only moves or shrinks through on_popup_size, which repaints the view.
+  Buffer *frame = nil;
+  if (t->transport == BOWSER_TRANSPORT_IOSURFACE && t->last) {
+    frame = take_buffer(t->pool, kViewPoolMax, t->last->surface, t->last);
+    if (frame) {
+      long x, y;
+      popup_origin(t, &x, &y);
+      blit(enc, t->last->texture, frame->texture, 0, 0);
+      blit(enc, p->texture, frame->texture, x, y);
+    }
+  }
+  [enc endEncoding];
+  [cb commit];
+  [cb waitUntilCompleted];
+  p->shownAt = ++t->frameNo;
+  t->popup = p;
+  if (frame) show(t, frame);
+  place_popup_layer(t);
+}
+
+static Tab *tab_of(cef_browser_t *browser);
+
+static void CEF_CALLBACK on_accelerated_paint(cef_render_handler_t *self, cef_browser_t *browser,
+                                              cef_paint_element_type_t type, size_t dirtyCount,
+                                              const cef_rect_t *dirty, const cef_accelerated_paint_info_t *info) {
+  Tab *t = tab_of(browser);
+  unref(browser);
+  IOSurfaceRef src = info->shared_texture_io_surface;
+  if (!t || !t->surface || !src) return;
+  if (metal_format(IOSurfaceGetPixelFormat(src)) == MTLPixelFormatInvalid) {
+    fprintf(stderr, "bowser-cef: unsupported pixel format %#x\n", (unsigned)IOSurfaceGetPixelFormat(src));
+    return;
+  }
+  if (type == PET_VIEW) paint_view(t, src);
+  else paint_popup(t, src);
+}
+
+static void CEF_CALLBACK on_popup_show(cef_render_handler_t *self, cef_browser_t *browser, int shown) {
+  Tab *t = tab_of(browser);
+  unref(browser);
+  if (!t) return;
+  t->popupShown = shown;
+  if (!shown) {
+    t->popup = nil;
+    [t->popupPool removeAllObjects];
+    place_popup_layer(t);
+    // The view under the popup didn't change, so CEF won't repaint it.
+    if (t->host && t->transport == BOWSER_TRANSPORT_IOSURFACE) t->host->invalidate(t->host, PET_VIEW);
+  }
+}
+
+static void CEF_CALLBACK on_popup_size(cef_render_handler_t *self, cef_browser_t *browser, const cef_rect_t *rect) {
+  Tab *t = tab_of(browser);
+  unref(browser);
+  if (!t) return;
+  // Keep the popup inside the view, as Chromium's own views do: a <select>
+  // near the bottom opens upward instead of off the surface.
+  cef_rect_t r = *rect;
+  int w = (int)lround(t->size.width), h = (int)lround(t->size.height);
+  if (r.x + r.width > w) r.x = w - r.width;
+  if (r.y + r.height > h) r.y = h - r.height;
+  r.x = MAX(r.x, 0);
+  r.y = MAX(r.y, 0);
+  t->popupRect = r;
+  place_popup_layer(t);
+  if (t->host && t->transport == BOWSER_TRANSPORT_IOSURFACE) t->host->invalidate(t->host, PET_VIEW);
 }
 
 // ---- Geometry -------------------------------------------------------
 
 static void CEF_CALLBACK get_view_rect(cef_render_handler_t *self, cef_browser_t *browser, cef_rect_t *rect) {
+  Tab *t = tab_of(browser);
   unref(browser);
-  *rect = (cef_rect_t){0, 0, (int)fmax(1, lround(g.size.width)), (int)fmax(1, lround(g.size.height))};
+  bowser_size_s s = t ? t->size : (bowser_size_s){800, 500, 2};
+  *rect = (cef_rect_t){0, 0, (int)fmax(1, lround(s.width)), (int)fmax(1, lround(s.height))};
 }
 
 static int CEF_CALLBACK get_screen_info(cef_render_handler_t *self, cef_browser_t *browser, cef_screen_info_t *info) {
+  Tab *t = tab_of(browser);
   unref(browser);
-  info->device_scale_factor = (float)g.size.scale;
+  info->device_scale_factor = t ? (float)t->size.scale : 2;
   info->depth = 24;
   info->depth_per_component = 8;
   return 1;
 }
 
 static void on_resize(void *ud, bowser_surface_t *s, bowser_size_s size) {
-  bool rescaled = size.scale != g.size.scale;
-  g.size = size;
-  if (!g.host) return;
-  if (g.last) g.resizeAt = CACurrentMediaTime(); // the first frame is a page load, not a resize
-  if (rescaled) g.host->notify_screen_info_changed(g.host);
-  g.host->was_resized(g.host);
+  Tab *t = tab_for_surface(s);
+  if (!t) return;
+  bool rescaled = size.scale != t->size.scale;
+  t->size = size;
+  if (!t->host) return;
+  if (t->last) t->resizeAt = CACurrentMediaTime(); // the first frame is a page load, not a resize
+  if (rescaled) t->host->notify_screen_info_changed(t->host);
+  t->host->was_resized(t->host);
 }
 
 // ---- Text input state -----------------------------------------------
@@ -285,19 +520,22 @@ static bowser_rect_s view_rect(cef_rect_t r) { return (bowser_rect_s){r.x, r.y, 
 static void CEF_CALLBACK on_ime_composition_range_changed(cef_render_handler_t *self, cef_browser_t *browser,
                                                           const cef_range_t *range, size_t count,
                                                           const cef_rect_t *bounds) {
+  Tab *t = tab_of(browser);
   unref(browser);
-  if (count == 0) return;
+  if (!t || !t->surface || count == 0) return;
   cef_rect_t end = bounds[count - 1];
-  bowser_surface_set_caret(g.surface, (bowser_rect_s){end.x + end.width, end.y, 2, end.height});
-  if (!g.composing) return;
+  bowser_surface_set_caret(t->surface, (bowser_rect_s){end.x + end.width, end.y, 2, end.height});
+  if (!t->composing) return;
   bowser_rect_s rects[count];
   for (size_t i = 0; i < count; i++) rects[i] = view_rect(bounds[i]);
-  bowser_surface_set_composition(g.surface, true, rects, count);
+  bowser_surface_set_composition(t->surface, true, rects, count);
 }
 
 static int CEF_CALLBACK on_cursor_change(cef_display_handler_t *self, cef_browser_t *browser, cef_cursor_handle_t h,
                                          cef_cursor_type_t type, const cef_cursor_info_t *custom) {
+  Tab *t = tab_of(browser);
   unref(browser);
+  if (!t || !t->surface) return 1;
   bowser_cursor_e c;
   switch (type) {
   case CT_IBEAM:
@@ -317,11 +555,196 @@ static int CEF_CALLBACK on_cursor_change(cef_display_handler_t *self, cef_browse
   case CT_ROWRESIZE: c = BOWSER_CURSOR_RESIZE_UP_DOWN; break;
   default: c = BOWSER_CURSOR_ARROW; break;
   }
-  if (c != g.cursor) {
-    g.cursor = c;
-    bowser_surface_set_cursor(g.surface, c);
+  if (c != t->cursor) {
+    t->cursor = c;
+    bowser_surface_set_cursor(t->surface, c);
   }
   return 1;
+}
+
+// ---- Navigation state -----------------------------------------------
+
+static void CEF_CALLBACK on_address_change(cef_display_handler_t *self, cef_browser_t *browser, cef_frame_t *frame,
+                                           const cef_string_t *url) {
+  Tab *t = tab_of(browser);
+  if (t && frame->is_main(frame)) {
+    t->url = ns_str(url);
+    state_changed(t);
+  }
+  unref(frame);
+  unref(browser);
+}
+
+static void CEF_CALLBACK on_title_change(cef_display_handler_t *self, cef_browser_t *browser,
+                                         const cef_string_t *title) {
+  Tab *t = tab_of(browser);
+  unref(browser);
+  if (!t) return;
+  t->title = ns_str(title);
+  state_changed(t);
+}
+
+static void CEF_CALLBACK on_loading_progress_change(cef_display_handler_t *self, cef_browser_t *browser,
+                                                    double progress) {
+  Tab *t = tab_of(browser);
+  unref(browser);
+  if (!t) return;
+  t->progress = progress;
+  state_changed(t);
+}
+
+static void CEF_CALLBACK on_loading_state_change(cef_load_handler_t *self, cef_browser_t *browser, int loading,
+                                                 int canGoBack, int canGoForward) {
+  Tab *t = tab_of(browser);
+  unref(browser);
+  if (!t) return;
+  t->loading = loading;
+  t->canGoBack = canGoBack;
+  t->canGoForward = canGoForward;
+  state_changed(t);
+}
+
+// An error page keeps the old address, but the user should see the one that failed.
+static void CEF_CALLBACK on_load_error(cef_load_handler_t *self, cef_browser_t *browser, cef_frame_t *frame,
+                                       cef_errorcode_t code, const cef_string_t *text, const cef_string_t *failed) {
+  Tab *t = tab_of(browser);
+  if (t && frame->is_main(frame) && code != ERR_ABORTED) { // ABORTED: stopped, or replaced by a newer load
+    t->url = ns_str(failed);
+    state_changed(t);
+  }
+  unref(frame);
+  unref(browser);
+}
+
+static void CEF_CALLBACK on_find_result(cef_find_handler_t *self, cef_browser_t *browser, int identifier, int count,
+                                        const cef_rect_t *selection, int active, int final) {
+  Tab *t = tab_of(browser);
+  unref(browser);
+  // Earlier updates count matches still being found, with none active yet.
+  if (!t || !final || (count == t->findCount && active == t->findActive)) return;
+  t->findCount = count;
+  t->findActive = active;
+  publish(t, @"find_result", @{@"count" : @(count), @"active" : @(active)});
+}
+
+// ---- Messages: the browser vocabulary (README.md) -------------------
+
+// What `navigate` loads for what the user typed. A URL with a scheme loads as
+// is. Something shaped like a host gets https://, or http:// for localhost
+// and IP addresses, which rarely have certificates. Anything else searches
+// DuckDuckGo.
+static NSString *fixup_url(NSString *typed) {
+  NSString *s = [typed stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  if (s.length == 0) return nil;
+  NSRange scheme = [s rangeOfString:@"^[A-Za-z][A-Za-z0-9+.-]*:" options:NSRegularExpressionSearch];
+  if (scheme.location != NSNotFound) {
+    NSString *name = [s substringToIndex:scheme.length - 1].lowercaseString;
+    // Without "//", "localhost:3000" also looks like a scheme; only these
+    // schemes take no authority.
+    if ([s rangeOfString:@"://"].location == scheme.length - 1 ||
+        [@[ @"about", @"data", @"mailto", @"view-source" ] containsObject:name])
+      return s;
+  }
+  if ([s rangeOfCharacterFromSet:NSCharacterSet.whitespaceCharacterSet].location == NSNotFound) {
+    NSString *hostPort = [s componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/?#"]][0];
+    NSString *host = [hostPort stringByReplacingOccurrencesOfString:@":[0-9]+$"
+                                                         withString:@""
+                                                            options:NSRegularExpressionSearch
+                                                              range:NSMakeRange(0, hostPort.length)];
+    bool local = [host isEqualToString:@"localhost"] ||
+                 [host rangeOfString:@"^([0-9]{1,3}\\.){3}[0-9]{1,3}$|^\\[[0-9A-Fa-f:]+\\]$"
+                             options:NSRegularExpressionSearch]
+                         .location != NSNotFound;
+    if (local) return [@"http://" stringByAppendingString:s];
+    if ([host rangeOfString:@"^([A-Za-z0-9-]+\\.)+[A-Za-z]{2,}$" options:NSRegularExpressionSearch].location !=
+        NSNotFound)
+      return [@"https://" stringByAppendingString:s];
+  }
+  NSMutableCharacterSet *allowed = [NSCharacterSet.URLQueryAllowedCharacterSet mutableCopy];
+  [allowed removeCharactersInString:@"&+=#"];
+  return [@"https://duckduckgo.com/?q=" stringByAppendingString:[s stringByAddingPercentEncodingWithAllowedCharacters:allowed]];
+}
+
+static void load(Tab *t, NSString *url) {
+  cef_frame_t *main = t->browser->get_main_frame(t->browser);
+  cef_string_t u = cef_str(url.UTF8String);
+  main->load_url(main, &u);
+  cef_string_clear(&u);
+  unref(main);
+}
+
+static bool flag(NSDictionary *body, NSString *key, bool fallback) {
+  id v = body[key];
+  return [v isKindOfClass:NSNumber.class] ? [v boolValue] : fallback;
+}
+
+// Act on one message. Returns an error, or nil.
+static NSString *handle_message(Tab *t, NSString *name, NSDictionary *body) {
+  if (!t->browser) return @"the page is still starting";
+  cef_browser_t *b = t->browser;
+  if ([name isEqualToString:@"navigate"]) {
+    id typed = body[@"url"];
+    NSString *url = [typed isKindOfClass:NSString.class] ? fixup_url(typed) : nil;
+    if (!url) return @"navigate needs a url";
+    load(t, url);
+  } else if ([name isEqualToString:@"back"]) {
+    b->go_back(b);
+  } else if ([name isEqualToString:@"forward"]) {
+    b->go_forward(b);
+  } else if ([name isEqualToString:@"reload"]) {
+    b->reload(b);
+  } else if ([name isEqualToString:@"stop"]) {
+    b->stop_load(b);
+  } else if ([name isEqualToString:@"edit"]) {
+    NSArray *commands = @[ @"copy", @"cut", @"paste", @"select_all", @"undo", @"redo", @"delete" ];
+    NSUInteger i = [commands indexOfObject:body[@"command"] ?: @""];
+    if (i == NSNotFound) return @"edit needs a command: copy, cut, paste, select_all, undo, redo, or delete";
+    // Edit commands act where the user is: the focused frame, such as an iframe.
+    cef_frame_t *f = b->get_focused_frame(b);
+    if (!f) f = b->get_main_frame(b);
+    void(CEF_CALLBACK * run[])(cef_frame_t *) = {f->copy, f->cut, f->paste, f->select_all, f->undo, f->redo, f->del};
+    run[i](f);
+    unref(f);
+  } else if ([name isEqualToString:@"find"]) {
+    id text = body[@"text"];
+    if (![text isKindOfClass:NSString.class] || [text length] == 0) return @"find needs text";
+    // CEF's findNext is Chromium's find_match: false only highlights, with no
+    // active match. A new text starts a new search either way, so a fresh
+    // search of the same text has to stop the old one first.
+    bool next = flag(body, @"next", false);
+    if (!next && [text isEqualToString:t->findText]) t->host->stop_finding(t->host, 0);
+    t->findText = text;
+    cef_string_t s = cef_str([text UTF8String]);
+    t->host->find(t->host, &s, flag(body, @"forward", true), 0, 1);
+    cef_string_clear(&s);
+  } else if ([name isEqualToString:@"find_stop"]) {
+    t->host->stop_finding(t->host, 0); // the active match stays selected, as in Safari and Chrome
+    t->findText = nil;
+    t->findCount = t->findActive = 0;
+  } else if ([name isEqualToString:@"zoom"]) {
+    id delta = body[@"delta"];
+    if (![delta isKindOfClass:NSNumber.class]) return @"zoom needs a delta: 1, -1, or 0";
+    int d = [delta intValue];
+    // Chromium's own steps (90%, 110%, ...), remembered per site in the profile.
+    t->host->zoom(t->host, d > 0 ? CEF_ZOOM_COMMAND_IN : d < 0 ? CEF_ZOOM_COMMAND_OUT : CEF_ZOOM_COMMAND_RESET);
+  } else {
+    return [NSString stringWithFormat:@"unknown message %@", name];
+  }
+  return nil;
+}
+
+static void on_message(void *ud, bowser_surface_t *s, const char *name, const char *body) {
+  Tab *t = tab_for_surface(s);
+  if (!t) return;
+  NSDictionary *args = @{};
+  if (body) {
+    id parsed = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:body length:strlen(body)] options:0
+                                                  error:nil];
+    if ([parsed isKindOfClass:NSDictionary.class]) args = parsed;
+  }
+  NSString *error = handle_message(t, @(name), args);
+  // A host gets no answers; a bad message is the host's bug, so say so here.
+  if (error) fprintf(stderr, "bowser-cef: %s: %s\n", t->sid.UTF8String, error.UTF8String);
 }
 
 // ---- Input from the host --------------------------------------------
@@ -337,7 +760,8 @@ static uint32_t cef_modifiers(uint64_t mods) {
 }
 
 static void on_mouse(void *ud, bowser_surface_t *s, const bowser_mouse_s *m) {
-  if (!g.host) return;
+  Tab *t = tab_for_surface(s);
+  if (!t || !t->host) return;
   // bowser numbers buttons left, right, middle.
   static const cef_mouse_button_type_t buttons[] = {CEF_MOUSE_BUTTON_LEFT, CEF_MOUSE_BUTTON_RIGHT,
                                                     CEF_MOUSE_BUTTON_MIDDLE};
@@ -359,13 +783,13 @@ static void on_mouse(void *ud, bowser_surface_t *s, const bowser_mouse_s *m) {
   };
   switch (m->action) {
   case BOWSER_MOUSE_DOWN:
-    g.heldButtons |= held[b];
+    t->heldButtons |= held[b];
     e.type = CEF_MOUSE_EVENT_DOWN;
     e.button = buttons[b];
     e.click_count = m->click_count;
     break;
   case BOWSER_MOUSE_UP:
-    g.heldButtons &= ~held[b];
+    t->heldButtons &= ~held[b];
     e.type = CEF_MOUSE_EVENT_UP;
     e.button = buttons[b];
     e.click_count = m->click_count;
@@ -374,16 +798,17 @@ static void on_mouse(void *ud, bowser_surface_t *s, const bowser_mouse_s *m) {
   case BOWSER_MOUSE_DRAG:
     e.type = CEF_MOUSE_EVENT_MOVE;
     for (int i = 0; i < 3; i++)
-      if (g.heldButtons & held[i]) e.button = buttons[i];
+      if (t->heldButtons & held[i]) e.button = buttons[i];
     break;
   case BOWSER_MOUSE_EXIT: e.type = CEF_MOUSE_EVENT_LEAVE; break;
   }
-  e.modifiers = cef_modifiers(m->mods) | g.heldButtons;
-  g.host->send_mouse_event(g.host, &e);
+  e.modifiers = cef_modifiers(m->mods) | t->heldButtons;
+  t->host->send_mouse_event(t->host, &e);
 }
 
 static void on_scroll(void *ud, bowser_surface_t *s, const bowser_scroll_s *sc) {
-  if (!g.host) return;
+  Tab *t = tab_for_surface(s);
+  if (!t || !t->host) return;
   // AppKit's line deltas become pixels the way Chromium's own Mac event
   // builder does it: 40 px per line.
   const float kPixelsPerLine = 40;
@@ -393,7 +818,7 @@ static void on_scroll(void *ud, bowser_surface_t *s, const bowser_scroll_s *sc) 
                       CEF_WHEEL_PHASE_ENDED | CEF_WHEEL_PHASE_CANCELLED | CEF_WHEEL_PHASE_MAY_BEGIN;
   cef_wheel_input_event_t w = {
       .size = sizeof w,
-      .modifiers = cef_modifiers(sc->mods) | g.heldButtons,
+      .modifiers = cef_modifiers(sc->mods) | t->heldButtons,
       .x = (float)sc->x,
       .y = (float)sc->y,
       .screen_x = (float)sc->x,
@@ -406,14 +831,14 @@ static void on_scroll(void *ud, bowser_surface_t *s, const bowser_scroll_s *sc) 
       .phase = sc->phase & kPhases,
       .momentum_phase = sc->momentum_phase & kPhases,
   };
-  g.host->send_wheel_event(g.host, &w);
+  t->host->send_wheel_event(t->host, &w);
 }
 
-static void send_char(cef_keyboard_input_event_t e, char16_t c) {
+static void send_char(Tab *t, cef_keyboard_input_event_t e, char16_t c) {
   e.type = CEF_KEY_EVENT_CHAR;
   memset(e.text, 0, sizeof e.text);
   e.text[0] = c;
-  g.host->send_keyboard_event(g.host, &e);
+  t->host->send_keyboard_event(t->host, &e);
 }
 
 // Text arrives in two parts, like AppKit's: key events here, and the text they
@@ -423,7 +848,8 @@ static void send_char(cef_keyboard_input_event_t e, char16_t c) {
 // Escape, Control and Command chords) get their CHAR right away, as Chromium's
 // own Mac view does.
 static void on_key(void *ud, bowser_surface_t *s, const bowser_key_s *k) {
-  if (!g.host) return;
+  Tab *t = tab_for_surface(s);
+  if (!t || !t->host) return;
   NSEvent *ns = [NSEvent keyEventWithType:k->action == BOWSER_KEY_RELEASE ? NSEventTypeKeyUp : NSEventTypeKeyDown
                                  location:NSZeroPoint
                             modifierFlags:(NSEventModifierFlags)k->mods
@@ -436,17 +862,17 @@ static void on_key(void *ud, bowser_surface_t *s, const bowser_key_s *k) {
                                   keyCode:k->keycode];
   cef_keyboard_input_event_t e = {.size = sizeof e};
   if (!ns || !cef_keyboard_input_event_from_mac_event((__bridge void *)ns, &e)) return;
-  g.host->send_keyboard_event(g.host, &e);
+  t->host->send_keyboard_event(t->host, &e);
   if (k->action == BOWSER_KEY_RELEASE) {
-    g.pendingKey.size = 0;
+    t->pendingKey.size = 0;
     return;
   }
   bool chord = k->mods & (NSEventModifierFlagControl | NSEventModifierFlagCommand);
-  if (!g.composing && e.text[0] && (e.text[0] < 0x20 || chord)) {
-    send_char(e, e.text[0]);
-    g.pendingKey.size = 0;
+  if (!t->composing && e.text[0] && (e.text[0] < 0x20 || chord)) {
+    send_char(t, e, e.text[0]);
+    t->pendingKey.size = 0;
   } else {
-    g.pendingKey = e;
+    t->pendingKey = e;
   }
 }
 
@@ -455,33 +881,34 @@ static cef_range_t cef_range(int64_t location, int64_t length) {
   return (cef_range_t){(uint32_t)location, (uint32_t)(location + length)};
 }
 
-static void end_composition(void) {
-  if (!g.composing) return;
-  g.composing = false;
-  bowser_surface_set_composition(g.surface, false, NULL, 0);
+static void end_composition(Tab *t) {
+  if (!t->composing) return;
+  t->composing = false;
+  bowser_surface_set_composition(t->surface, false, NULL, 0);
 }
 
-static void on_text(void *ud, bowser_surface_t *s, const bowser_text_s *t) {
-  if (!g.host) return;
-  NSString *text = @(t->text ? t->text : "");
+static void on_text(void *ud, bowser_surface_t *s, const bowser_text_s *in) {
+  Tab *t = tab_for_surface(s);
+  if (!t || !t->host) return;
+  NSString *text = @(in->text ? in->text : "");
   cef_string_t str = cef_str(text.UTF8String);
-  cef_range_t replacement = cef_range(t->replacement_location, t->replacement_length);
-  switch (t->kind) {
+  cef_range_t replacement = cef_range(in->replacement_location, in->replacement_length);
+  switch (in->kind) {
   case BOWSER_TEXT_INSERT:
     // One character typed with a key goes in as that key's CHAR, so pages see
     // keypress. Anything else (IME commits, emoji, dictation) is a commit.
-    if (!g.composing && g.pendingKey.size && text.length == 1) {
-      send_char(g.pendingKey, [text characterAtIndex:0]);
+    if (!t->composing && t->pendingKey.size && text.length == 1) {
+      send_char(t, t->pendingKey, [text characterAtIndex:0]);
     } else {
-      g.host->ime_commit_text(g.host, &str, &replacement, 0);
+      t->host->ime_commit_text(t->host, &str, &replacement, 0);
     }
-    g.pendingKey.size = 0;
-    end_composition();
+    t->pendingKey.size = 0;
+    end_composition(t);
     break;
   case BOWSER_TEXT_SET_MARKED:
     if (text.length == 0) {
-      g.host->ime_cancel_composition(g.host);
-      end_composition();
+      t->host->ime_cancel_composition(t->host);
+      end_composition(t);
       break;
     }
     cef_composition_underline_t underline = {
@@ -490,59 +917,215 @@ static void on_text(void *ud, bowser_surface_t *s, const bowser_text_s *t) {
         .color = 0xFF000000,
         .style = CEF_CUS_SOLID,
     };
-    cef_range_t selection = t->selected_location < 0 ? cef_range((int64_t)text.length, 0)
-                                                      : cef_range(t->selected_location, t->selected_length);
-    g.composing = true;
-    g.pendingKey.size = 0;
-    g.host->ime_set_composition(g.host, &str, 1, &underline, &replacement, &selection);
+    cef_range_t selection = in->selected_location < 0 ? cef_range((int64_t)text.length, 0)
+                                                      : cef_range(in->selected_location, in->selected_length);
+    t->composing = true;
+    t->pendingKey.size = 0;
+    t->host->ime_set_composition(t->host, &str, 1, &underline, &replacement, &selection);
     break;
   case BOWSER_TEXT_UNMARK:
-    g.host->ime_finish_composing_text(g.host, 0);
-    end_composition();
+    t->host->ime_finish_composing_text(t->host, 0);
+    end_composition(t);
     break;
   }
   cef_string_clear(&str);
 }
 
 static void on_focus(void *ud, bowser_surface_t *s, bool focused) {
-  if (g.host) g.host->set_focus(g.host, focused);
+  Tab *t = tab_for_surface(s);
+  if (t && t->host) t->host->set_focus(t->host, focused);
 }
 
 static void on_attach(void *ud, bowser_surface_t *s, bool attached) {
-  g.attached = attached;
-  if (!g.host) return;
+  Tab *t = tab_for_surface(s);
+  if (!t) return;
+  t->attached = attached;
+  emit(@{@"event" : @"attached", @"surface" : t->sid, @"attached" : @(attached)});
+  if (!attached) {
+    // Keep only the frame a new host will be shown first.
+    [t->pool filterUsingPredicate:[NSPredicate predicateWithFormat:@"self == %@", t->last]];
+  }
+  if (!t->host) return;
   // A tab no one shows is hidden: Chromium stops painting and throttles it.
-  g.host->was_hidden(g.host, !attached);
+  t->host->was_hidden(t->host, !attached);
+  if (!attached) return;
   // A page that isn't changing paints nothing new, so give a new host the
-  // frame we already have.
-  if (attached && g.last) show(g.last);
+  // frame we already have, and the state, which it can't have yet.
+  if (t->last) show(t, t->last);
+  bowser_surface_send(t->surface, "state", json_text(state_of(t)).UTF8String);
 }
 
 static void on_wakeup(void *ud) {
-  dispatch_async(dispatch_get_main_queue(), ^{ bowser_producer_tick(g.producer); });
+  bowser_transport_e transport = (bowser_transport_e)(intptr_t)ud;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (E.producers[transport]) bowser_producer_tick(E.producers[transport]);
+  });
+}
+
+// ---- Tabs -----------------------------------------------------------
+
+// Each browser gets its own client, which leads CEF's callbacks back to its tab.
+typedef struct {
+  cef_client_t client;
+  atomic_int refs;
+  void *tab; // a retained Tab, released with the client
+} TabClient;
+
+static void CEF_CALLBACK client_add_ref(cef_base_ref_counted_t *self) {
+  atomic_fetch_add(&((TabClient *)self)->refs, 1);
+}
+static int CEF_CALLBACK client_release(cef_base_ref_counted_t *self) {
+  TabClient *c = (TabClient *)self;
+  if (atomic_fetch_sub(&c->refs, 1) != 1) return 0;
+  CFRelease(c->tab);
+  free(c);
+  return 1;
+}
+static int CEF_CALLBACK client_has_one_ref(cef_base_ref_counted_t *self) {
+  return atomic_load(&((TabClient *)self)->refs) == 1;
+}
+static int CEF_CALLBACK client_has_ref(cef_base_ref_counted_t *self) {
+  return atomic_load(&((TabClient *)self)->refs) >= 1;
+}
+
+static Tab *tab_of(cef_browser_t *browser) {
+  cef_browser_host_t *h = browser->get_host(browser);
+  cef_client_t *c = h ? h->get_client(h) : NULL;
+  Tab *t = c && c->base.add_ref == client_add_ref ? (__bridge Tab *)((TabClient *)c)->tab : nil;
+  unref(c);
+  unref(h);
+  return t;
+}
+
+static cef_client_t *new_client(Tab *t);
+
+static void start_browser(Tab *t) {
+  t->started = true;
+  cef_window_info_t wi = {
+      .size = sizeof wi,
+      .windowless_rendering_enabled = 1,
+      .shared_texture_enabled = 1,
+  };
+  cef_browser_settings_t bs = {
+      .size = sizeof bs,
+      .windowless_frame_rate = (int)NSScreen.mainScreen.maximumFramesPerSecond,
+      .background_color = 0xFFFFFFFF, // opaque, like a browser tab
+  };
+  cef_string_t url = cef_str(t->startURL.UTF8String);
+  cef_browser_host_create_browser(&wi, new_client(t), &url, &bs, NULL, NULL);
+  cef_string_clear(&url);
+}
+
+static bowser_producer_t *producer_for(bowser_transport_e transport) {
+  if (E.producers[transport]) return E.producers[transport];
+  bowser_producer_config_s cfg = {
+      .size = sizeof cfg,
+      .transport = transport,
+      .userdata = (void *)(intptr_t)transport,
+      .wakeup_cb = on_wakeup,
+      .key_cb = on_key,
+      .mouse_cb = on_mouse,
+      .scroll_cb = on_scroll,
+      .text_cb = on_text,
+      .resize_cb = on_resize,
+      .focus_cb = on_focus,
+      .attach_cb = on_attach,
+      .message_cb = on_message,
+  };
+  if (bowser_producer_new(&cfg, &E.producers[transport]) != BOWSER_OK) return NULL;
+  return E.producers[transport];
+}
+
+static Tab *open_tab(NSString *url, bowser_transport_e transport, NSString **error) {
+  bowser_producer_t *p = producer_for(transport);
+  Tab *t = [Tab new];
+  t->transport = transport;
+  t->size = (bowser_size_s){800, 500, NSScreen.mainScreen.backingScaleFactor};
+  if (!p || bowser_surface_new(p, t->size, &t->surface) != BOWSER_OK) {
+    *error = @(bowser_last_error());
+    return nil;
+  }
+  t->sid = [NSString stringWithFormat:@"%u", ++E.nextId];
+  t->startURL = url;
+  t->url = url;
+  t->pool = [NSMutableArray new];
+  t->popupPool = [NSMutableArray new];
+  t->sources = [NSMutableSet new];
+  CALayer *root = bowser_surface_root_layer(t->surface);
+  if (root) {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    t->content = [CALayer layer];
+    t->content.anchorPoint = CGPointZero;
+    t->content.opaque = YES;
+    [root addSublayer:t->content];
+    t->popupLayer = [CALayer layer];
+    t->popupLayer.anchorPoint = CGPointZero;
+    t->popupLayer.hidden = YES;
+    [root addSublayer:t->popupLayer];
+    [CATransaction commit];
+  }
+  E.tabs[t->sid] = t;
+  E.bySurface[[NSValue valueWithPointer:t->surface]] = t;
+  if (E.contextReady) start_browser(t);
+  else [E.pending addObject:t];
+  return t;
+}
+
+// Hosts learn at once (the surface ends); the browser closes after.
+static void close_tab(Tab *t) {
+  if (!t->surface) return;
+  [E.bySurface removeObjectForKey:[NSValue valueWithPointer:t->surface]];
+  bowser_surface_free(t->surface);
+  t->surface = NULL;
+  t->attached = false;
+  t->last = t->popup = nil;
+  [t->pool removeAllObjects];
+  [t->popupPool removeAllObjects];
+  if (t->host) t->host->close_browser(t->host, 1);
+  // A browser that CEF is still making closes in on_after_created.
+  if (!t->started) {
+    [E.pending removeObject:t];
+    [E.tabs removeObjectForKey:t->sid];
+  }
+}
+
+static void quit(void) {
+  if (E.quitting) return;
+  E.quitting = true;
+  for (Tab *t in E.tabs.allValues) close_tab(t);
+  if (E.tabs.count == 0) cef_quit_message_loop();
 }
 
 // ---- Browser lifetime -----------------------------------------------
 
 static void CEF_CALLBACK on_after_created(cef_life_span_handler_t *self, cef_browser_t *browser) {
-  g.browser = browser; // keep the reference we were given
-  g.host = browser->get_host(browser);
-  g.host->was_resized(g.host); // the host may have resized us before now
-  g.host->was_hidden(g.host, !g.attached);
+  Tab *t = tab_of(browser);
+  if (!t) return unref(browser);
+  t->browser = browser; // keep the reference we were given
+  t->host = browser->get_host(browser);
+  if (!t->surface) { // closed while CEF was making it
+    t->host->close_browser(t->host, 1);
+    return;
+  }
+  t->host->was_resized(t->host); // the host may have resized us before now
+  t->host->was_hidden(t->host, !t->attached);
 }
 
 static void CEF_CALLBACK on_before_close(cef_life_span_handler_t *self, cef_browser_t *browser) {
+  Tab *t = tab_of(browser);
   unref(browser);
-  unref(g.host);
-  unref(g.browser);
-  g.host = NULL;
-  g.browser = NULL;
-  cef_quit_message_loop();
-}
-
-static void quit(void) {
-  if (g.host) g.host->close_browser(g.host, 1);
-  else cef_quit_message_loop();
+  if (!t) return;
+  unref(t->host);
+  unref(t->browser);
+  t->host = NULL;
+  t->browser = NULL;
+  if (t->surface) { // CEF closed it on its own
+    close_tab(t);
+    emit(@{@"event" : @"closed", @"surface" : t->sid});
+  }
+  [E.tabs removeObjectForKey:t->sid];
+  if (E.quitting && E.tabs.count == 0) cef_quit_message_loop();
 }
 
 // ---- Native UI the producer must never show -------------------------
@@ -551,7 +1134,8 @@ static void quit(void) {
 // on whatever screen the user is looking at. Suppress them until the ABI can
 // hand them to the host.
 
-// Open links that target a new window in this browser instead.
+// Links that target a new window (target=_blank, window.open) open in this
+// tab instead: the host owns tabs, and there is no message for "new tab" yet.
 static int CEF_CALLBACK on_before_popup(cef_life_span_handler_t *self, cef_browser_t *browser, cef_frame_t *frame,
                                         int popup_id, const cef_string_t *url, const cef_string_t *name,
                                         cef_window_open_disposition_t disposition, int gesture,
@@ -610,12 +1194,26 @@ static cef_render_handler_t render_handler = {
     STATIC_BASE(cef_render_handler_t),
     .get_view_rect = get_view_rect,
     .get_screen_info = get_screen_info,
+    .on_popup_show = on_popup_show,
+    .on_popup_size = on_popup_size,
     .on_accelerated_paint = on_accelerated_paint,
     .on_ime_composition_range_changed = on_ime_composition_range_changed,
 };
 static cef_display_handler_t display_handler = {
     STATIC_BASE(cef_display_handler_t),
+    .on_address_change = on_address_change,
+    .on_title_change = on_title_change,
+    .on_loading_progress_change = on_loading_progress_change,
     .on_cursor_change = on_cursor_change,
+};
+static cef_load_handler_t load_handler = {
+    STATIC_BASE(cef_load_handler_t),
+    .on_loading_state_change = on_loading_state_change,
+    .on_load_error = on_load_error,
+};
+static cef_find_handler_t find_handler = {
+    STATIC_BASE(cef_find_handler_t),
+    .on_find_result = on_find_result,
 };
 static cef_life_span_handler_t life_span_handler = {
     STATIC_BASE(cef_life_span_handler_t),
@@ -642,40 +1240,138 @@ static cef_dialog_handler_t dialog_handler = {
   static type *CEF_CALLBACK name(cef_client_t *self) { return &object; }
 GETTER(get_render_handler, cef_render_handler_t, render_handler)
 GETTER(get_display_handler, cef_display_handler_t, display_handler)
+GETTER(get_load_handler, cef_load_handler_t, load_handler)
+GETTER(get_find_handler, cef_find_handler_t, find_handler)
 GETTER(get_life_span_handler, cef_life_span_handler_t, life_span_handler)
 GETTER(get_context_menu_handler, cef_context_menu_handler_t, context_menu_handler)
 GETTER(get_jsdialog_handler, cef_jsdialog_handler_t, jsdialog_handler)
 GETTER(get_dialog_handler, cef_dialog_handler_t, dialog_handler)
 
-static cef_client_t client = {
-    STATIC_BASE(cef_client_t),
-    .get_render_handler = get_render_handler,
-    .get_display_handler = get_display_handler,
-    .get_life_span_handler = get_life_span_handler,
-    .get_context_menu_handler = get_context_menu_handler,
-    .get_jsdialog_handler = get_jsdialog_handler,
-    .get_dialog_handler = get_dialog_handler,
-};
+// The new client's one reference goes to CEF with create_browser.
+static cef_client_t *new_client(Tab *t) {
+  TabClient *c = calloc(1, sizeof *c);
+  c->client = (cef_client_t){
+      .base = {.size = sizeof(cef_client_t), .add_ref = client_add_ref, .release = client_release,
+               .has_one_ref = client_has_one_ref, .has_at_least_one_ref = client_has_ref},
+      .get_render_handler = get_render_handler,
+      .get_display_handler = get_display_handler,
+      .get_load_handler = get_load_handler,
+      .get_find_handler = get_find_handler,
+      .get_life_span_handler = get_life_span_handler,
+      .get_context_menu_handler = get_context_menu_handler,
+      .get_jsdialog_handler = get_jsdialog_handler,
+      .get_dialog_handler = get_dialog_handler,
+  };
+  atomic_init(&c->refs, 1);
+  c->tab = (void *)CFBridgingRetain(t);
+  return &c->client;
+}
+
+// ---- Control commands -----------------------------------------------
+
+static bool parse_transport(id value, bowser_transport_e *out) {
+  if (value == nil || [value isEqual:@"calayerhost"]) *out = BOWSER_TRANSPORT_CALAYERHOST;
+  else if ([value isEqual:@"iosurface"]) *out = BOWSER_TRANSPORT_IOSURFACE;
+  else return false;
+  return true;
+}
+
+static NSDictionary *run_command(NSDictionary *cmd) {
+  NSString *name = cmd[@"cmd"];
+  if (![name isKindOfClass:NSString.class]) return @{@"error" : @"no cmd"};
+  if ([name isEqualToString:@"open"]) {
+    bowser_transport_e transport;
+    if (!parse_transport(cmd[@"transport"], &transport)) return @{@"error" : @"transport: calayerhost or iosurface"};
+    id typed = cmd[@"url"];
+    NSString *url = [typed isKindOfClass:NSString.class] ? fixup_url(typed) : nil;
+    NSString *error;
+    Tab *t = open_tab(url ?: @"about:blank", transport, &error);
+    return t ? @{@"surface" : t->sid} : @{@"error" : error};
+  }
+  id sid = cmd[@"surface"];
+  Tab *t = [sid isKindOfClass:NSString.class] ? E.tabs[sid] : nil;
+  if (!t || !t->surface) return @{@"error" : [NSString stringWithFormat:@"no surface %@", sid]};
+  if ([name isEqualToString:@"ticket"]) {
+    char *ticket = bowser_surface_ticket(t->surface);
+    NSDictionary *reply = @{@"ticket" : @(ticket)};
+    bowser_string_free(ticket);
+    return reply;
+  }
+  if ([name isEqualToString:@"close"]) {
+    close_tab(t);
+    return @{};
+  }
+  if ([name isEqualToString:@"message"]) {
+    id message = cmd[@"name"], body = cmd[@"body"];
+    if (![message isKindOfClass:NSString.class]) return @{@"error" : @"message needs a name"};
+    if ([body isKindOfClass:NSString.class])
+      body = [NSJSONSerialization JSONObjectWithData:[body dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+    NSString *error = handle_message(t, message, [body isKindOfClass:NSDictionary.class] ? body : @{});
+    return error ? @{@"error" : error} : @{};
+  }
+  return @{@"error" : [NSString stringWithFormat:@"unknown cmd %@", name]};
+}
+
+static void run_line(NSData *line) {
+  id cmd = [NSJSONSerialization JSONObjectWithData:line options:0 error:nil];
+  if (![cmd isKindOfClass:NSDictionary.class]) {
+    emit(@{@"error" : @"not a JSON object"});
+    return;
+  }
+  NSMutableDictionary *reply = [run_command(cmd) mutableCopy];
+  if (cmd[@"id"]) reply[@"id"] = cmd[@"id"];
+  emit(reply);
+}
+
+// Read commands from stdin. Its end means our parent is gone: quit.
+static void start_control(void) {
+  E.line = [NSMutableData new];
+  fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
+  E.input = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, STDIN_FILENO, 0, dispatch_get_main_queue());
+  dispatch_source_set_event_handler(E.input, ^{
+    char buf[16384];
+    ssize_t n;
+    while ((n = read(STDIN_FILENO, buf, sizeof buf)) > 0) [E.line appendBytes:buf length:(NSUInteger)n];
+    bool ended = n == 0 || (errno != EAGAIN && errno != EINTR); // before commands can change errno
+    for (;;) {
+      const char *bytes = E.line.bytes;
+      const char *nl = memchr(bytes, '\n', E.line.length);
+      if (!nl) break;
+      NSUInteger len = (NSUInteger)(nl - bytes);
+      if (len) run_line([E.line subdataWithRange:NSMakeRange(0, len)]);
+      [E.line replaceBytesInRange:NSMakeRange(0, len + 1) withBytes:NULL length:0];
+    }
+    if (ended) {
+      dispatch_source_cancel(E.input);
+      quit();
+    }
+  });
+  dispatch_resume(E.input);
+}
+
+// ---- App ------------------------------------------------------------
 
 static void CEF_CALLBACK on_context_initialized(cef_browser_process_handler_t *self) {
-  cef_window_info_t wi = {
-      .size = sizeof wi,
-      .windowless_rendering_enabled = 1,
-      .shared_texture_enabled = 1,
-  };
-  cef_browser_settings_t bs = {
-      .size = sizeof bs,
-      .windowless_frame_rate = (int)NSScreen.mainScreen.maximumFramesPerSecond,
-      .background_color = 0xFFFFFFFF, // opaque, like a browser tab
-  };
-  cef_string_t url = cef_str(g.url);
-  cef_browser_host_create_browser(&wi, &client, &url, &bs, NULL, NULL);
-  cef_string_clear(&url);
+  E.contextReady = true;
+  for (Tab *t in E.pending) start_browser(t);
+  [E.pending removeAllObjects];
+  if (E.control) {
+    emit(@{@"event" : @"ready", @"pid" : @(getpid())});
+    start_control();
+  }
+}
+
+// Another process started with our profile. It exits (see main); we carry on.
+static int CEF_CALLBACK on_already_running_app_relaunch(cef_browser_process_handler_t *self,
+                                                        cef_command_line_t *cl, const cef_string_t *dir) {
+  unref(cl);
+  return 1;
 }
 
 static cef_browser_process_handler_t browser_process_handler = {
     STATIC_BASE(cef_browser_process_handler_t),
     .on_context_initialized = on_context_initialized,
+    .on_already_running_app_relaunch = on_already_running_app_relaunch,
 };
 
 static void CEF_CALLBACK on_before_command_line_processing(cef_app_t *self, const cef_string_t *process_type,
@@ -698,8 +1394,6 @@ static cef_app_t app = {
     .get_browser_process_handler = get_browser_process_handler,
 };
 
-// ---- Main -----------------------------------------------------------
-
 // CEF needs NSApp to tell it when AppKit is inside sendEvent:.
 @interface BowserApplication : NSApplication <CefAppProtocol> {
   BOOL handlingSendEvent;
@@ -718,17 +1412,30 @@ static cef_app_t app = {
 
 int main(int argc, char **argv) {
   @autoreleasepool {
-    g.transport = BOWSER_TRANSPORT_CALAYERHOST;
-    g.url = "https://example.com";
-    int tickets = 1;
+    bowser_transport_e transport = BOWSER_TRANSPORT_CALAYERHOST;
+    NSString *url = nil, *profile = nil;
+    int tickets = -1;
     for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--transport") && i + 1 < argc)
-        g.transport = !strcmp(argv[++i], "iosurface") ? BOWSER_TRANSPORT_IOSURFACE : BOWSER_TRANSPORT_CALAYERHOST;
+        transport = !strcmp(argv[++i], "iosurface") ? BOWSER_TRANSPORT_IOSURFACE : BOWSER_TRANSPORT_CALAYERHOST;
       else if (!strcmp(argv[i], "--url") && i + 1 < argc)
-        g.url = argv[++i];
+        url = @(argv[++i]);
       else if (!strcmp(argv[i], "--tickets") && i + 1 < argc)
         tickets = atoi(argv[++i]);
+      else if (!strcmp(argv[i], "--profile") && i + 1 < argc)
+        profile = @(argv[++i]);
     }
+    E.control = !url && tickets < 0;
+    if (!profile) {
+      // $HOME first, so a sandboxed parent with a fake HOME keeps us inside it.
+      const char *home = getenv("HOME");
+      profile = [(home && *home ? @(home) : NSHomeDirectory())
+          stringByAppendingPathComponent:@"Library/Application Support/libbowser/profile"];
+    }
+    profile = profile.stringByStandardizingPath;
+    if (![profile isAbsolutePath])
+      profile = [NSFileManager.defaultManager.currentDirectoryPath stringByAppendingPathComponent:profile];
+    [NSFileManager.defaultManager createDirectoryAtPath:profile withIntermediateDirectories:YES attributes:nil error:nil];
 
     [BowserApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
@@ -739,63 +1446,48 @@ int main(int argc, char **argv) {
       return 1;
     }
 
-    // A profile per process: two producers can't share one, and nothing in
-    // it needs to outlive the producer yet.
-    NSString *profile = [NSTemporaryDirectory() stringByAppendingFormat:@"bowser-cef.%d", getpid()];
+    // One profile, on disk, for every tab: cookies, logins, and site zoom
+    // persist. Chromium locks it, so one engine at a time can use it.
     cef_settings_t settings = {
         .size = sizeof settings,
         .windowless_rendering_enabled = 1,
         .root_cache_path = cef_str(profile.UTF8String),
+        .cache_path = cef_str(profile.UTF8String),
+        .persist_session_cookies = 1, // like a browser that restores its tabs
         .log_file = cef_str([profile stringByAppendingPathComponent:@"cef.log"].UTF8String),
         .log_severity = LOGSEVERITY_ERROR,
     };
     cef_main_args_t args = {argc, argv};
     int ok = cef_initialize(&args, &settings, &app, NULL);
     cef_string_clear(&settings.root_cache_path);
+    cef_string_clear(&settings.cache_path);
     cef_string_clear(&settings.log_file);
     if (!ok) {
-      fprintf(stderr, "bowser-cef: cef_initialize failed (%d)\n", cef_get_exit_code());
+      fprintf(stderr, "bowser-cef: cef_initialize failed (%d); is another bowser-cef using %s?\n",
+              cef_get_exit_code(), profile.UTF8String);
       return 1;
     }
 
-    g.device = MTLCreateSystemDefaultDevice();
-    g.queue = [g.device newCommandQueue];
-    g.pool = [NSMutableArray new];
-    g.sources = [NSMutableSet new];
-    g.size = (bowser_size_s){800, 500, NSScreen.mainScreen.backingScaleFactor};
-    bowser_producer_config_s cfg = {
-        .size = sizeof cfg,
-        .transport = g.transport,
-        .wakeup_cb = on_wakeup,
-        .key_cb = on_key,
-        .mouse_cb = on_mouse,
-        .scroll_cb = on_scroll,
-        .text_cb = on_text,
-        .resize_cb = on_resize,
-        .focus_cb = on_focus,
-        .attach_cb = on_attach,
-    };
-    if (bowser_producer_new(&cfg, &g.producer) != BOWSER_OK ||
-        bowser_surface_new(g.producer, g.size, &g.surface) != BOWSER_OK) {
-      fprintf(stderr, "bowser-cef: %s\n", bowser_last_error());
-      return 1;
+    E.device = MTLCreateSystemDefaultDevice();
+    E.queue = [E.device newCommandQueue];
+    E.tabs = [NSMutableDictionary new];
+    E.bySurface = [NSMutableDictionary new];
+    E.pending = [NSMutableArray new];
+
+    if (!E.control) {
+      NSString *error;
+      Tab *t = open_tab(url ?: @"https://example.com", transport, &error);
+      if (!t) {
+        fprintf(stderr, "bowser-cef: %s\n", error.UTF8String);
+        return 1;
+      }
+      for (int i = 0; i < MAX(tickets, 1); i++) {
+        char *ticket = bowser_surface_ticket(t->surface);
+        printf("%s\n", ticket);
+        bowser_string_free(ticket);
+      }
+      fflush(stdout);
     }
-    CALayer *root = bowser_surface_root_layer(g.surface);
-    if (root) {
-      [CATransaction begin];
-      [CATransaction setDisableActions:YES];
-      g.content = [CALayer layer];
-      g.content.anchorPoint = CGPointZero;
-      g.content.opaque = YES;
-      [root addSublayer:g.content];
-      [CATransaction commit];
-    }
-    for (int i = 0; i < tickets; i++) {
-      char *t = bowser_surface_ticket(g.surface);
-      printf("%s\n", t);
-      bowser_string_free(t);
-    }
-    fflush(stdout);
 
     dispatch_source_t signals[2];
     int numbers[2] = {SIGTERM, SIGINT};
@@ -805,15 +1497,14 @@ int main(int argc, char **argv) {
       dispatch_source_set_event_handler(signals[i], ^{ quit(); });
       dispatch_resume(signals[i]);
     }
+    // A controller that dies leaves stdout with no reader. Quit through stdin's
+    // EOF rather than die of SIGPIPE.
+    signal(SIGPIPE, SIG_IGN);
 
     cef_run_message_loop();
 
-    g.last = nil;
-    [g.pool removeAllObjects];
-    bowser_surface_free(g.surface);
-    bowser_producer_free(g.producer);
+    for (int i = 0; i < 2; i++) bowser_producer_free(E.producers[i]);
     cef_shutdown();
-    [NSFileManager.defaultManager removeItemAtPath:profile error:nil];
   }
   return 0;
 }

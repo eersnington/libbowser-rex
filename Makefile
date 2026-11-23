@@ -77,3 +77,10 @@ test-cef: $(CEF_APP) $(BUILD)/e2e-cef
 cef: $(CEF_APP) $(BUILD)/bowser-host $(BUILD)/cef/bowser-cef-bench
 
 .PHONY: cef
+
+# ---- Rex plugin, end to end with the real engine ----
+
+test-rex: $(CEF_APP)
+	cd rex/plugin && go test -count=1 ./...
+
+.PHONY: test-rex

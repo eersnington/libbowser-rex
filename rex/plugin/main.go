@@ -1,5 +1,6 @@
 // Command rexplugin is a Rex block plugin that offers the dev.libbowser.browser
-// block flavor. Each block runs one libbowser producer and hands out its tickets.
+// block flavor. Every block is one surface of a shared bowser-cef engine,
+// which hands out the tickets hosts attach with.
 //
 // Rex starts it from a --block-dir. See ../PROTOCOL.md for the wire protocol.
 package main
@@ -54,16 +55,16 @@ func main() {
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
 		s := <-sigs
-		log.Printf("got %v, stopping producers", s)
+		log.Printf("got %v, stopping the engine", s)
 		cleanup()
 		os.Exit(0)
 	}()
-	// If the server dies without signalling us, we get reparented. Don't leak producers.
+	// If the server dies without signalling us, we get reparented. Don't leak the engine.
 	go func() {
 		parent := os.Getppid()
 		for range time.Tick(time.Second) {
 			if os.Getppid() != parent {
-				log.Print("server is gone, stopping producers")
+				log.Print("server is gone, stopping the engine")
 				cleanup()
 				os.Exit(0)
 			}

@@ -20,6 +20,12 @@ bowser_size_s bw_get_size(bw_rd *);
 void bw_put_rect(bw_buf *, bowser_rect_s);
 bowser_rect_s bw_get_rect(bw_rd *);
 
+// A message's name and body (see "Messages" in bowser.h), checked. Put fails
+// with BOWSER_ERR_INVALID and leaves the buffer empty.
+bowser_result_e bw_put_message(bw_buf *, const char *name, const char *body);
+// Both malloc'd; *body is NULL when there is none. False if malformed.
+bool bw_get_message(bw_rd *, char **name, char **body);
+
 static inline bw_rd bw_reader(const bw_buf *b) { return (bw_rd){.p = b->data, .left = b->len}; }
 
 #endif

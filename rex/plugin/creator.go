@@ -11,9 +11,9 @@ var creatorList = map[string]any{
 			"name":        "browser",
 			"flavor":      flavorName,
 			"title":       "Browser",
-			"description": "Runs a libbowser producer and hands out tickets that a host attaches with.",
+			"description": "A browser tab in the shared bowser-cef engine. Hosts attach with a ticket.",
 			"options_schema": obj(map[string]any{
-				"url": map[string]any{"type": "string", "description": "The page to open. bowser-test ignores it."},
+				"url": map[string]any{"type": "string", "description": "The page to open, as typed into an address bar."},
 				"transport": map[string]any{"type": "string", "enum": []string{"calayerhost", "iosurface"},
 					"description": "How frames reach the host. Defaults to calayerhost."},
 			}),
@@ -24,30 +24,58 @@ var creatorList = map[string]any{
 					"description":  "Get a fresh single-use ticket to attach a host to this block's surface.",
 					"input_schema": obj(map[string]any{}),
 					"output_schema": obj(map[string]any{
-						"ticket":    map[string]any{"type": "string", "description": "Pass it to bowser_host_attach."},
-						"remaining": map[string]any{"type": "integer", "minimum": 0, "description": "Tickets left in this producer's batch."},
-					}, "ticket", "remaining"),
+						"ticket": map[string]any{"type": "string", "description": "Pass it to bowser_host_attach within 60 s."},
+					}, "ticket"),
 				},
 				"state": map[string]any{
-					"description":  "Describe the block's producer.",
+					"description":  "The page's newest state, and the block's engine.",
 					"input_schema": obj(map[string]any{}),
-					"output_schema": obj(map[string]any{
-						"url":          map[string]any{"type": "string"},
-						"transport":    map[string]any{"type": "string", "enum": []string{"calayerhost", "iosurface"}},
-						"producer_pid": map[string]any{"type": "integer", "minimum": 0, "description": "0 once the producer has exited."},
-					}, "url", "transport", "producer_pid"),
+					"output_schema": obj(stateProps(map[string]any{
+						"transport":  map[string]any{"type": "string", "enum": []string{"calayerhost", "iosurface"}},
+						"engine_pid": map[string]any{"type": "integer", "minimum": 0, "description": "0 while the block has no surface."},
+					})),
 				},
+				"navigate": map[string]any{
+					"description": "Load what was typed: a URL, a host, or words to search for.",
+					"input_schema": obj(map[string]any{
+						"url": map[string]any{"type": "string"},
+					}, "url"),
+				},
+				"back":    plainMethod("Go back in the page's history."),
+				"forward": plainMethod("Go forward in the page's history."),
+				"reload":  plainMethod("Reload the page."),
+				"stop":    plainMethod("Stop loading the page."),
 			},
 			"events": map[string]any{
-				"producer_exited": obj(map[string]any{
-					"pid":    map[string]any{"type": "integer"},
-					"status": map[string]any{"type": "string", "description": "How it ended, such as \"exit status 1\" or \"signal: killed\"."},
-				}, "pid", "status"),
+				"state": obj(stateProps(nil)),
+				"error": obj(map[string]any{
+					"message": map[string]any{"type": "string"},
+				}, "message"),
 				"host_attached": obj(map[string]any{}),
 				"host_detached": obj(map[string]any{}),
 			},
 		},
 	}},
+}
+
+// The producer's state message (adapters/cef/README.md), plus extra.
+func stateProps(extra map[string]any) map[string]any {
+	props := map[string]any{
+		"url":            map[string]any{"type": "string"},
+		"title":          map[string]any{"type": "string"},
+		"loading":        map[string]any{"type": "boolean"},
+		"progress":       map[string]any{"type": "number", "minimum": 0, "maximum": 1},
+		"can_go_back":    map[string]any{"type": "boolean"},
+		"can_go_forward": map[string]any{"type": "boolean"},
+	}
+	for k, v := range extra {
+		props[k] = v
+	}
+	return props
+}
+
+func plainMethod(description string) map[string]any {
+	return map[string]any{"description": description, "input_schema": obj(map[string]any{})}
 }
 
 func obj(props map[string]any, required ...string) map[string]any {

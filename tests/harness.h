@@ -44,6 +44,8 @@ static void pump(double seconds) {
 @property NSMutableString *buffer;
 @property NSMutableArray<NSString *> *lines; // unread echo lines
 @property NSMutableArray<NSString *> *tickets;
+@property int in; // the producer's stdin, for spawnWithInput:
++ (instancetype)spawnWithInput:(NSArray<NSString *> *)all;
 + (instancetype)start:(NSArray<NSString *> *)args tickets:(int)count;
 + (instancetype)start:(NSArray<NSString *> *)args tickets:(int)count env:(NSDictionary<NSString *, NSString *> *)env;
 + (instancetype)spawn:(NSArray<NSString *> *)all tickets:(int)count;
@@ -68,16 +70,32 @@ static void pump(double seconds) {
   return [self spawn:all tickets:count env:@{}];
 }
 
-// Start any producer: all[0] is its path. It must print `count` tickets.
-+ (instancetype)spawn:(NSArray<NSString *> *)all tickets:(int)count env:(NSDictionary<NSString *, NSString *> *)env {
+// Start a producer we talk to on its stdin. It prints no tickets.
++ (instancetype)spawnWithInput:(NSArray<NSString *> *)all {
+  return [self spawn:all tickets:0 env:@{} input:YES];
+}
 
++ (instancetype)spawn:(NSArray<NSString *> *)all tickets:(int)count env:(NSDictionary<NSString *, NSString *> *)env {
+  return [self spawn:all tickets:count env:env input:NO];
+}
+
+// Start any producer: all[0] is its path. It must print `count` tickets.
++ (instancetype)spawn:(NSArray<NSString *> *)all
+              tickets:(int)count
+                  env:(NSDictionary<NSString *, NSString *> *)env
+                input:(BOOL)input {
   Producer *p = [Producer new];
-  int fds[2];
+  int fds[2], ins[2] = {-1, -1};
   pipe(fds);
+  if (input) {
+    pipe(ins);
+    fcntl(ins[1], F_SETFD, FD_CLOEXEC);
+  }
   posix_spawn_file_actions_t fa;
   posix_spawn_file_actions_init(&fa);
   posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
   posix_spawn_file_actions_addclose(&fa, fds[0]);
+  if (input) posix_spawn_file_actions_adddup2(&fa, ins[0], STDIN_FILENO);
   char *argv[16] = {0};
   for (NSUInteger i = 0; i < all.count && i < 15; i++) argv[i] = (char *)[all[i] UTF8String];
   NSMutableArray<NSString *> *vars = [NSMutableArray new];
@@ -95,6 +113,8 @@ static void pump(double seconds) {
     exit(1);
   }
   close(fds[1]);
+  if (input) close(ins[0]);
+  p.in = ins[1];
   fcntl(fds[0], F_SETFL, O_NONBLOCK);
   p.pid = pid;
   [running addObject:@(pid)];
@@ -170,6 +190,7 @@ static void pump(double seconds) {
   [running removeObject:@(self.pid)];
   waitpid(self.pid, NULL, 0);
   close(self.out);
+  if (self.in >= 0) close(self.in);
 }
 
 // Ask the producer to exit so it can clean up; kill it after 5 s.
@@ -179,6 +200,7 @@ static void pump(double seconds) {
     if (waitpid(self.pid, NULL, WNOHANG) == self.pid) {
       [running removeObject:@(self.pid)];
       close(self.out);
+      if (self.in >= 0) close(self.in);
       return;
     }
     pump(0.01);
@@ -201,6 +223,7 @@ static void pump(double seconds) {
 @property int wakeups;
 @property BOOL detachInCaret;
 @property int callbacksAfterDetach;
+@property NSMutableArray<NSString *> *messages; // "name body", in arrival order
 @end
 
 @implementation Host
@@ -231,6 +254,10 @@ static void on_cursor(void *ud, bowser_host_t *_, bowser_cursor_e c) {
   if (!from(ud).handle) from(ud).callbacksAfterDetach++;
   from(ud).cursor = c;
 }
+static void on_message(void *ud, bowser_host_t *_, const char *name, const char *body) {
+  if (!from(ud).messages) from(ud).messages = [NSMutableArray new];
+  [from(ud).messages addObject:[NSString stringWithFormat:@"%s %s", name, body ? body : "(null)"]];
+}
 static void on_detached(void *ud, bowser_host_t *_, bowser_result_e why) {
   from(ud).detached = YES;
   from(ud).detachedWhy = why;
@@ -252,6 +279,7 @@ static bowser_result_e attach_host(NSString *ticket, Host *h) {
       .composition_cb = on_composition,
       .cursor_cb = on_cursor,
       .detached_cb = on_detached,
+      .message_cb = on_message,
   };
   bowser_host_t *handle = NULL;
   bowser_result_e rc = bowser_host_attach(ticket.UTF8String, &cfg, &handle);

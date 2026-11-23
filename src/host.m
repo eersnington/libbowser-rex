@@ -15,6 +15,22 @@
 
 #define ATTACH_TIMEOUT_NS (3 * NSEC_PER_SEC)
 
+// Messages waiting for a tick before the host stops reading. A host that
+// doesn't tick then pushes back on the producer, as a producer does on hosts.
+#define MAX_MESSAGES 4096
+
+@interface BWMessage : NSObject {
+ @public
+  char *name, *body;
+}
+@end
+@implementation BWMessage
+- (void)dealloc {
+  free(name);
+  free(body);
+}
+@end
+
 @interface BWHost : NSObject {
  @public
   bowser_host_config_s cfg;
@@ -30,6 +46,8 @@
   bool compositionActive;
   NSData *compositionRects;
   bowser_cursor_e cursor;
+  NSMutableArray<BWMessage *> *messages; // in order, never merged
+  bool paused;                           // too many messages; reading waits for a tick
   bowser_result_e ended;     // why the connection ended; BOWSER_OK while it's up
   IOSurfaceRef pendingFrame; // newest unshown frame, IOSURFACE only
   bool closed;               // bowser_host_detach ran
@@ -72,7 +90,7 @@ static void host_read(BWHost *h) {
   [h->lock lock];
   uint16_t type;
   bw_buf payload;
-  while (!h->closed && !h->ended && bw_link_next(h->link, &type, &payload)) {
+  while (!h->closed && !h->ended && !h->paused && bw_link_next(h->link, &type, &payload)) {
     bw_rd r = bw_reader(&payload);
     switch (type) {
     case BW_MSG_CARET: {
@@ -101,6 +119,17 @@ static void host_read(BWHost *h) {
       h->hasCursor = woke = true;
       break;
     }
+    case BW_MSG_PRODUCER_MESSAGE: {
+      BWMessage *m = [BWMessage new];
+      if (!bw_get_message(&r, &m->name, &m->body)) break;
+      [h->messages addObject:m];
+      woke = true;
+      if (h->messages.count >= MAX_MESSAGES) {
+        bw_link_pause(h->link);
+        h->paused = true;
+      }
+      break;
+    }
     case BW_MSG_DETACH:
       h->ended = peer_reason(bw_get_u32(&r));
       break;
@@ -108,7 +137,7 @@ static void host_read(BWHost *h) {
     bw_buf_free(&payload);
   }
   bowser_result_e why;
-  if (!h->closed && (h->ended || bw_link_ended(h->link, &why))) {
+  if (!h->closed && !h->paused && (h->ended || bw_link_ended(h->link, &why))) {
     if (!h->ended) h->ended = why;
     bw_link_close(h->link);
     woke = true;
@@ -250,6 +279,7 @@ bowser_result_e bowser_host_attach(const char *ticket, const bowser_host_config_
   h->transport = transport;
   h->size = size;
   h->lock = [NSLock new];
+  h->messages = [NSMutableArray new];
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
   h->layer = [CALayer layer];
@@ -322,6 +352,12 @@ void bowser_host_tick(bowser_host_t *handle) {
   NSData *rects = h->compositionRects;
   bowser_cursor_e cursor = h->cursor;
   h->hasCaret = h->hasComposition = h->hasCursor = false;
+  NSArray<BWMessage *> *messages = h->messages.count ? [h->messages copy] : nil;
+  [h->messages removeAllObjects];
+  if (h->paused) {
+    h->paused = false;
+    bw_link_resume(h->link);
+  }
   bowser_result_e ended = h->endReported ? BOWSER_OK : h->ended;
   if (ended) h->endReported = true;
   IOSurfaceRef frame = h->pendingFrame;
@@ -344,6 +380,11 @@ void bowser_host_tick(bowser_host_t *handle) {
   if (hasComposition && h->cfg.composition_cb && !h->closed)
     h->cfg.composition_cb(ud, handle, active, rects.bytes, rects.length / sizeof(bowser_rect_s));
   if (hasCursor && h->cfg.cursor_cb && !h->closed) h->cfg.cursor_cb(ud, handle, cursor);
+  // Messages sent before the producer let go arrive before detached_cb.
+  for (BWMessage *m in messages) {
+    if (!h->cfg.message_cb || h->closed) break;
+    h->cfg.message_cb(ud, handle, m->name, m->body);
+  }
   if (ended && h->cfg.detached_cb && !h->closed) h->cfg.detached_cb(ud, handle, ended);
 }
 
@@ -419,4 +460,11 @@ bowser_result_e bowser_host_text(bowser_host_t *h, const bowser_text_s *t) {
   bw_put_i64(&b, t->replacement_location);
   bw_put_i64(&b, t->replacement_length);
   return send_msg(H(h), BW_MSG_TEXT, &b);
+}
+
+bowser_result_e bowser_host_send(bowser_host_t *h, const char *name, const char *body) {
+  bw_buf b = {0};
+  bowser_result_e rc = bw_put_message(&b, name, body);
+  if (rc) return rc;
+  return send_msg(H(h), BW_MSG_MESSAGE, &b);
 }

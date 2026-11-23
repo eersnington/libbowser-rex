@@ -347,6 +347,124 @@ static void test_detach_in_a_callback_ends_callbacks(void) {
   [p kill];
 }
 
+// ---- Messages -----------------------------------------------------------
+
+static BOOL host_got(Host *h, NSString *message) {
+  return wait_for(^{ return [h.messages containsObject:message]; }, 3);
+}
+
+static void test_messages_keep_their_place_among_input(void) {
+  Producer *p = [Producer start:@[] tickets:1];
+  Host *h;
+  CHECK(attach(p.tickets[0], &h) == BOWSER_OK, "attach");
+  CHECK([p expect:@"s0 attached"], "attached");
+  // Stopped, so everything below queues up in the host, where latest-wins
+  // input merges. Messages must neither merge nor move.
+  kill(p.pid, SIGSTOP);
+  bowser_mouse_s m = {.action = BOWSER_MOUSE_MOVE, .x = 1, .y = 1};
+  bowser_host_mouse(h.handle, &m);
+  text(h, BOWSER_TEXT_INSERT, "a");
+  bowser_host_send(h.handle, "navigate", "{\"url\":\"x\"}");
+  bowser_host_mouse(h.handle, &m);
+  bowser_host_send(h.handle, "back", NULL);
+  bowser_host_send(h.handle, "back", NULL);
+  m.x = 2;
+  bowser_host_mouse(h.handle, &m);
+  text(h, BOWSER_TEXT_INSERT, "b");
+  bowser_host_send(h.handle, "ping", "1");
+  kill(p.pid, SIGCONT);
+
+  NSArray *want = @[
+    @"s0 text 0 a", @"s0 message navigate {\"url\":\"x\"}", @"s0 message back (null)", @"s0 message back (null)",
+    @"s0 text 0 b", @"s0 message ping 1"
+  ];
+  NSMutableArray *got = [NSMutableArray new];
+  NSString *l;
+  while (got.count < want.count && (l = [p nextLine:3]))
+    if (![l hasPrefix:@"s0 mouse"]) [got addObject:l];
+  CHECK([got isEqualToArray:want], "in order, none merged:\n      want %s\n      got  %s",
+        [want componentsJoinedByString:@" | "].UTF8String, [got componentsJoinedByString:@" | "].UTF8String);
+  CHECK(host_got(h, @"pong 1"), "the producer's answer reaches the host: %s",
+        [h.messages componentsJoinedByString:@" | "].UTF8String);
+  detach(h);
+  [p kill];
+}
+
+static void test_a_later_host_gets_no_old_messages(void) {
+  Producer *p = [Producer start:@[ @"--tickets", @"2" ] tickets:2];
+  Host *a, *b;
+  CHECK(attach(p.tickets[0], &a) == BOWSER_OK, "attach a");
+  CHECK(host_got(a, @"hello (null)"), "a gets the producer's attach message");
+  detach(a);
+  CHECK([p expect:@"s0 send missed failed 4"], "a send with no host attached fails with DISCONNECTED");
+  CHECK(attach(p.tickets[1], &b) == BOWSER_OK, "attach b");
+  CHECK(host_got(b, @"hello (null)"), "b gets the message sent on its attach");
+  pump(0.3);
+  CHECK([b.messages isEqualToArray:@[ @"hello (null)" ]], "and nothing sent before it attached: %s",
+        [b.messages componentsJoinedByString:@" | "].UTF8String);
+  detach(b);
+  [p kill];
+}
+
+static void test_bad_messages_are_refused_not_fatal(void) {
+  Producer *p = [Producer start:@[] tickets:1];
+  Host *h;
+  CHECK(attach(p.tickets[0], &h) == BOWSER_OK, "attach");
+  char *big = malloc(BOWSER_MESSAGE_MAX + 2);
+  memset(big, 'x', BOWSER_MESSAGE_MAX + 1);
+  big[BOWSER_MESSAGE_MAX + 1] = 0;
+  CHECK(bowser_host_send(h.handle, "big", big) == BOWSER_ERR_INVALID, "a body over BOWSER_MESSAGE_MAX is refused");
+  big[BOWSER_MESSAGE_MAX] = 0;
+  CHECK(bowser_host_send(h.handle, "max", big) == BOWSER_OK, "a body of exactly BOWSER_MESSAGE_MAX is sent");
+  free(big);
+  CHECK(bowser_host_send(h.handle, "two words", NULL) == BOWSER_ERR_INVALID, "a name that isn't an identifier is refused");
+  CHECK(bowser_host_send(h.handle, "", NULL) == BOWSER_ERR_INVALID, "an empty name is refused");
+
+  bowser_host_send(h.handle, "grow", @(BOWSER_MESSAGE_MAX + 1).stringValue.UTF8String);
+  CHECK([p expect:@"s0 send grown failed 1"], "the producer's oversize send is refused at its call");
+  bowser_host_send(h.handle, "grow", @(BOWSER_MESSAGE_MAX).stringValue.UTF8String);
+  CHECK(wait_for(^{
+          for (NSString *m in h.messages)
+            if ([m hasPrefix:@"grown "] && m.length == 6 + BOWSER_MESSAGE_MAX) return YES;
+          return NO;
+        }, 3),
+        "a full-size message reaches the host whole");
+  bowser_host_send(h.handle, "ping", "after");
+  CHECK(host_got(h, @"pong after"), "both directions still work");
+  CHECK(!h.detached, "the host stays attached");
+  detach(h);
+  [p kill];
+}
+
+static void test_a_host_built_before_messages_still_works(void) {
+  Producer *p = [Producer start:@[] tickets:1];
+  Host *h = [Host new];
+  // An older caller's struct ends at detached_cb. Whatever follows it in
+  // memory must never be read as message_cb.
+  bowser_host_config_s old = {
+      .size = BOWSER_HOST_CONFIG_MIN_SIZE,
+      .userdata = (__bridge void *)h,
+      .wakeup_cb = on_wakeup,
+      .detached_cb = on_detached,
+      .message_cb = (void *)(uintptr_t)0xdead,
+  };
+  bowser_host_t *handle = NULL;
+  CHECK(bowser_host_attach(p.tickets[0].UTF8String, &old, &handle) == BOWSER_OK, "attach with the old size: %s",
+        bowser_last_error());
+  if (!handle) {
+    [p kill];
+    return;
+  }
+  h.handle = handle;
+  CFBridgingRetain(h);
+  bowser_host_send(handle, "ping", "old");
+  CHECK([p expect:@"s0 message ping old"], "its messages reach the producer");
+  pump(0.3); // the producer's hello and pong arrive and are dropped
+  [p kill];
+  CHECK(wait_for(^{ return h.detached; }, 3), "and it still hears that the producer died");
+  detach(h);
+}
+
 // ---- In-process producer, for checks only the producer side can see -----
 
 @interface Local : NSObject
@@ -587,6 +705,10 @@ int main(void) {
         {"an expired ticket is refused", test_expired_ticket_is_refused},
         {"oversize text is refused, not fatal", test_oversize_text_is_refused_not_fatal},
         {"detaching in a callback ends the callbacks", test_detach_in_a_callback_ends_callbacks},
+        {"messages keep their place among input", test_messages_keep_their_place_among_input},
+        {"a host that attaches later gets no old messages", test_a_later_host_gets_no_old_messages},
+        {"bad messages are refused, not fatal", test_bad_messages_are_refused_not_fatal},
+        {"a host built before messages still works", test_a_host_built_before_messages_still_works},
         {"a host keeps its frames in use until replaced", test_host_keeps_its_frames_in_use},
         {"the frame service survives hostile messages", test_frame_service_survives_hostile_messages},
     };

@@ -27,6 +27,9 @@ EOF
 
 frameworks="$app/Contents/Frameworks"
 mkdir -p "$app/Contents/MacOS" "$frameworks"
+# Replace executables, never overwrite them: the kernel caches a binary's code
+# signature by file, and an exec of a file changed in place can die of SIGKILL.
+rm -f "$app/Contents/MacOS/$name"
 cp "$main" "$app/Contents/MacOS/$name"
 plist "$app/Contents/Info.plist" "$name" "$id"
 
@@ -43,6 +46,7 @@ for kind in "" Alerts GPU Plugin Renderer; do
   helper_name="$name Helper${kind:+ ($kind)}"
   contents="$frameworks/$helper_name.app/Contents"
   mkdir -p "$contents/MacOS"
+  rm -f "$contents/MacOS/$helper_name"
   cp "$helper" "$contents/MacOS/$helper_name"
   plist "$contents/Info.plist" "$helper_name" "$id.helper$(echo "${kind:+.$kind}" | tr '[:upper:]' '[:lower:]')"
 done

@@ -220,7 +220,8 @@ static void conn_read(BWProducer *p, BWConn *c) {
     } else if (c->state == CONN_WELCOME && type == BW_MSG_READY) {
       handle_ready(p, c);
       woke = true;
-    } else if (c->state == CONN_LIVE && type >= BW_MSG_RESIZE && type <= BW_MSG_TEXT) {
+    } else if (c->state == CONN_LIVE &&
+               ((type >= BW_MSG_RESIZE && type <= BW_MSG_TEXT) || type == BW_MSG_MESSAGE)) {
       enqueue(p, type, c->surface, &payload);
       woke = true;
       if (p->events.count >= MAX_EVENTS) {
@@ -483,6 +484,14 @@ static void dispatch_event(BWProducer *p, BWEvent *e) {
     free(text);
     break;
   }
+  case BW_MSG_MESSAGE: {
+    char *name, *body;
+    if (!bw_get_message(&r, &name, &body)) break;
+    if (cfg->message_cb) cfg->message_cb(ud, s, name, body);
+    free(name);
+    free(body);
+    break;
+  }
   }
 }
 
@@ -631,4 +640,11 @@ bowser_result_e bowser_surface_set_cursor(bowser_surface_t *s, bowser_cursor_e c
   bw_buf b = {0};
   bw_put_u32(&b, cursor);
   return send_to_host(s, BW_MSG_CURSOR, &b);
+}
+
+bowser_result_e bowser_surface_send(bowser_surface_t *s, const char *name, const char *body) {
+  bw_buf b = {0};
+  bowser_result_e rc = bw_put_message(&b, name, body);
+  if (rc) return rc;
+  return send_to_host(s, BW_MSG_PRODUCER_MESSAGE, &b);
 }

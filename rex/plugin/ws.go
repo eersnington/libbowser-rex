@@ -1,14 +1,16 @@
 package main
 
-// Minimal RFC 6455 server side: enough for Rex's rex.control.v1 channel.
+// Minimal RFC 6455, both sides: enough for Rex's rex.control.v1 channel.
 // No extensions are negotiated, so frames are never compressed.
 
 import (
 	"bufio"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -18,9 +20,10 @@ import (
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 type wsConn struct {
-	conn net.Conn
-	r    *bufio.Reader
-	wmu  sync.Mutex
+	conn   net.Conn
+	r      *bufio.Reader
+	wmu    sync.Mutex
+	client bool // clients mask what they send
 }
 
 func wsUpgrade(w http.ResponseWriter, r *http.Request, subprotocol string) (*wsConn, error) {
@@ -46,6 +49,31 @@ func wsUpgrade(w http.ResponseWriter, r *http.Request, subprotocol string) (*wsC
 		return nil, err
 	}
 	return &wsConn{conn: conn, r: rw.Reader}, nil
+}
+
+// wsClient upgrades conn, already connected, to a WebSocket.
+func wsClient(conn net.Conn, host, path, subprotocol string) (*wsConn, error) {
+	var nonce [16]byte
+	rand.Read(nonce[:])
+	key := base64.StdEncoding.EncodeToString(nonce[:])
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"+
+		"Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: %s\r\n\r\n",
+		path, host, key, subprotocol)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return nil, err
+	}
+	r := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(r, &http.Request{Method: "GET"})
+	if err != nil {
+		return nil, err
+	}
+	resp.Body.Close()
+	sum := sha1.Sum([]byte(key + wsGUID))
+	if resp.StatusCode != http.StatusSwitchingProtocols ||
+		resp.Header.Get("Sec-WebSocket-Accept") != base64.StdEncoding.EncodeToString(sum[:]) {
+		return nil, fmt.Errorf("ws: upgrade refused: %s", resp.Status)
+	}
+	return &wsConn{conn: conn, r: r, client: true}, nil
 }
 
 // ReadMessage returns the next text or binary message, answering pings and closes.
@@ -114,13 +142,27 @@ func (c *wsConn) writeFrame(op byte, p []byte) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	h := []byte{0x80 | op}
+	var mask byte
+	if c.client {
+		mask = 0x80
+	}
 	switch n := len(p); {
 	case n < 126:
-		h = append(h, byte(n))
+		h = append(h, mask|byte(n))
 	case n <= 0xffff:
-		h = append(h, 126, byte(n>>8), byte(n))
+		h = append(h, mask|126, byte(n>>8), byte(n))
 	default:
-		h = binary.BigEndian.AppendUint64(append(h, 127), uint64(n))
+		h = binary.BigEndian.AppendUint64(append(h, mask|127), uint64(n))
+	}
+	if c.client {
+		var key [4]byte
+		rand.Read(key[:])
+		h = append(h, key[:]...)
+		masked := make([]byte, len(p))
+		for i := range p {
+			masked[i] = p[i] ^ key[i%4]
+		}
+		p = masked
 	}
 	_, err := c.conn.Write(append(h, p...))
 	return err

@@ -7,7 +7,8 @@
 - [x] IOSURFACE transport (IOSurface mach ports over a bootstrap service)
 - [x] Single-use tickets, host takeover, reattach, producer-death detection
 - [x] Test producer and Swift host, with input, IME text, caret, and cursor
-- [x] End-to-end tests: 18 cases, real processes
+- [x] End-to-end tests: 22 cases, real processes
+- [x] Message channel: `bowser_surface_send`/`bowser_host_send` and `message_cb`, in order with input, 64 KiB bodies
 
 ## Step 1b: hardening ✅
 
@@ -42,6 +43,18 @@ CEF 158.0.3 (Chromium 158.0.8127.18), C API, sandboxed helpers.
 - [x] Resize without stretched frames (a frame always shows at its own size)
 - [ ] Resize without blank frames: while the host grows, a strip of host background shows until the new-size frame arrives (12-18 ms). Needs a resize fence between host and producer.
 - [ ] 120 fps: not measurable on this 60 Hz machine
+- [x] One engine, many surfaces: each surface is a browser; one persistent profile (`--profile`); control on stdin/stdout
+- [x] Browser messages: navigate, history, reload/stop, edit commands, find, zoom; `state` and `find_result` back (`adapters/cef/README.md`)
+- [x] `<select>` and other popups composited on both transports
+
+Memory, Wikipedia's "Web browser" in hidden tabs, after load, summed over
+the engine and all its helpers (`footprint` is what Activity Monitor shows):
+
+| | Processes | RSS sum | Footprint sum |
+|---|---|---|---|
+| One engine, 1 tab | 7 | 631 MB | 227 MB |
+| One engine, 4 tabs | 10 | 993 MB | 445 MB |
+| 4 engines, 1 tab each | 28 | 2288 MB | 915 MB |
 
 CEF lends its IOSurface only for the length of `on_accelerated_paint` and
 reuses it from a pool of 2-3. The adapter copies each frame (Metal blit) into
@@ -78,14 +91,12 @@ paint callback; CPU is `ps` CPU time over the scroll, as % of one core.
 - [x] Client: injected dev copy of Rex mounts surfaces in `dev.libbowser.browser` panes (`rex-client/`)
 - [x] End to end in a real Rex window: block → plugin-started producer → ticket via `block call` → CALAYERHOST in the pane, 60 fps
 - [x] Isolation: dev server and client run in a kernel sandbox, fake HOME (server), own bundle ID (client), Space 3, no activation
-- [ ] Producers mint tickets on request (stdin `ticket` line) instead of a batch of 16
+- [x] Producers mint tickets on request (the engine's `ticket` command) instead of a batch of 16
+- [x] One bowser-cef for all browser blocks; restarted on the next call after it dies; blocks get an `error` event
+- [x] Block methods `navigate`, `back`, `forward`, `reload`, `stop`; `state` event; block label follows the page title
 - [ ] Pane focus: clicking a bowser pane should also move Rex's focus to that block
-- [ ] One dev harness: `rex/dev-server.sh` and `rex-client/run.sh` overlap; keep `rex-client/run.sh`
+- [x] One dev harness: `rex-client/run.sh` (`rex/dev-server.sh` is gone)
 - [ ] Share the host view between `examples/host-swift` and `rex-client/RexBowser.swift`
-
-## Proposals
-
-- **Generic message channel.** Engines need more than input and IME state: navigation, title, URL, load progress, find-in-page. A `bowser_surface_send(type, bytes, len)` / `message_cb` pair with app-defined types would carry them without growing the ABI per feature. Open: whether messages are latest-wins by type, and how big they may be (the 1 MiB frame limit applies).
 
 ## Known gaps
 
@@ -98,9 +109,11 @@ paint callback; CPU is `ps` CPU time over the scroll, as % of one core.
 - A connection that sends HELLO but never READY holds a socket until it closes. The uid check limits this to the producer's own user.
 - `bowser_host_attach` blocks the calling thread for up to 3 s when the producer is stopped or busy.
 - Moving test windows to a Space uses private CGS calls (`BOWSER_SPACE`).
-- CEF: `<select>` popups (`PET_POPUP`) aren't composited.
-- CEF: menus, JS dialogs, file pickers, and new windows are suppressed (links open in place). The ABI has no way to hand them to the host.
+- CEF: menus, JS dialogs, and file pickers are suppressed; new windows open in the same tab. The vocabulary has no way to hand them to the host yet.
+- CEF: a renderer crash leaves the tab blank, with no event. It needs a `crashed` state and a reload.
+- CEF: a hidden tab (no host) can report `loading: true` long after its page finished; Chromium throttles hidden pages.
 - CEF: the host's screen position isn't in the ABI, so CEF gets view coordinates as screen coordinates.
 - CEF: caret rects arrive only during an IME composition (`on_ime_composition_range_changed`), not for a plain caret.
 - CEF: AppKit commands (`doCommandBySelector:`, such as emacs bindings) don't reach the producer. Return, Tab, Escape, and Control/Command chords are sent as CHAR events instead.
-- CEF: one profile per process in `$TMPDIR`, removed on a clean exit. Nothing persists.
+- CEF: one engine per profile. A second engine on the same profile (a demo while the Rex plugin runs) exits; pass `--profile`.
+- Rex: the dev client copy can't be run twice, so pane UX against the shared engine is checked with the CLI and `bowser-host`, not in a Rex window.

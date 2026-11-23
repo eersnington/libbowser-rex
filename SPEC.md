@@ -121,7 +121,7 @@ compared on the same producer.
 Conventions, the same as libghostty:
 
 - Opaque handles: `bowser_*_t`.
-- Config structs passed by pointer, with a `size` field first for forward compatibility. They grow only at the end. The library accepts any size from `BOWSER_*_CONFIG_MIN_SIZE` up and zero-fills missing fields. In 0.x the minimum is the whole struct; at 1.0 it freezes at the 1.0 layout.
+- Config structs passed by pointer, with a `size` field first for forward compatibility. They grow only at the end. The library accepts any size from `BOWSER_*_CONFIG_MIN_SIZE` up and zero-fills missing fields. The minimum ends just before `message_cb`, the first field added after the first release; at 1.0 it freezes at the 1.0 layout.
 - Callbacks take a `void *userdata`. Pointers a callback gets are valid only until it returns.
 - **Threading:** each producer or host belongs to the embedder's thread. The library never calls host code on an arbitrary thread to do work. It calls `wakeup_cb`, from any thread, and the embedder then calls `*_tick()` on its own thread. `wakeup_cb` must not block or call into the library. Every other callback runs inside `*_tick()`. Only `bowser_abi_version`, `bowser_last_error`, and `bowser_string_free` are safe on any thread.
 - Errors: functions return `bowser_result_e`. A failing call sets `bowser_last_error()` for the calling thread; success doesn't clear it.
@@ -172,6 +172,7 @@ typedef struct {
   void (*resize_cb)(void *ud, bowser_surface_t *, bowser_size_s);
   void (*focus_cb)(void *ud, bowser_surface_t *, bool focused);
   void (*attach_cb)(void *ud, bowser_surface_t *, bool attached);
+  void (*message_cb)(void *ud, bowser_surface_t *, const char *name, const char *body);
 } bowser_producer_config_s;
 
 bowser_result_e bowser_producer_new(const bowser_producer_config_s *, bowser_producer_t **out);
@@ -193,6 +194,7 @@ bowser_result_e bowser_surface_set_caret(bowser_surface_t *, bowser_rect_s caret
 bowser_result_e bowser_surface_set_composition(bowser_surface_t *, bool active,
                                                const bowser_rect_s *char_rects, size_t count);
 bowser_result_e bowser_surface_set_cursor(bowser_surface_t *, int bowser_cursor_shape);
+bowser_result_e bowser_surface_send(bowser_surface_t *, const char *name, const char *body);
 
 // ---- Host side ------------------------------------------------------
 
@@ -208,6 +210,7 @@ typedef struct {
                          const bowser_rect_s *char_rects, size_t count);
   void (*cursor_cb)(void *ud, bowser_host_t *, int bowser_cursor_shape);
   void (*detached_cb)(void *ud, bowser_host_t *, bowser_result_e why);
+  void (*message_cb)(void *ud, bowser_host_t *, const char *name, const char *body);
 } bowser_host_config_s;
 
 bowser_result_e bowser_host_attach(const char *ticket, const bowser_host_config_s *,
@@ -224,9 +227,23 @@ bowser_result_e bowser_host_key(bowser_host_t *, const struct bowser_key_s *);
 bowser_result_e bowser_host_mouse(bowser_host_t *, const struct bowser_mouse_s *);
 bowser_result_e bowser_host_scroll(bowser_host_t *, const struct bowser_scroll_s *);
 bowser_result_e bowser_host_text(bowser_host_t *, const struct bowser_text_s *);
+bowser_result_e bowser_host_send(bowser_host_t *, const char *name, const char *body);
 
 void bowser_string_free(char *);
 ```
+
+### Messages
+
+Everything that isn't pixels or input travels as a small named message:
+navigation, titles, edit commands. The library defines the channel; each
+engine adapter defines its vocabulary (bowser-cef's is in
+`adapters/cef/README.md`).
+
+- `name` is 1-64 of `[A-Za-z0-9_.-]`. `body` is UTF-8 (JSON by convention) or NULL, at most `BOWSER_MESSAGE_MAX` (64 KiB). Anything else is refused with `BOWSER_ERR_INVALID` at the call; the connection stays up.
+- Each direction is in order. Host messages share the input queue: never merged, never reordered against keys or text, and they hold their place when latest-wins input around them merges.
+- Nothing is kept for a host that isn't attached: `bowser_surface_send` returns `BOWSER_ERR_DISCONNECTED`. A producer sends its current state from `attach_cb`.
+- `message_cb` is the last field of both config structs. The `*_MIN_SIZE` constants still end at the field before it, so callers built before messages keep working and never have `message_cb` read past their struct.
+- A host that doesn't tick stops reading after 4096 unread messages, as a producer does with input.
 
 ### Input structs
 
@@ -307,6 +324,6 @@ libbowser/
 - **Ticket exchange.** Decided in step 1: a Unix socket in a 0700 directory carries control, the ticket is `bowser2:<socket path>#<token>`, and IOSURFACE frames use a bootstrap Mach service named in WELCOME.
 - **Rex integration.** Rex lists only first-party creators today. A browser block needs a creator API or first-party support.
 - **Who renders the cursor.** The producer sends a cursor shape and the host sets `NSCursor`. Custom image cursors need a bitmap path.
-- **Popups and `<select>` menus.** CEF draws some popups in a separate paint type. Composite them in the producer, or give the host a second layer?
+- **Popups and `<select>` menus.** Decided: the producer composites them. CALAYERHOST adds a sublayer; IOSURFACE draws the popup into each frame. The host sees one surface.
 - **Accessibility.** Mirror the tree over XPC, or use `NSAccessibilityRemoteUIElement` (private)?
 - **Remote hosts.** An HEVC transport with VideoToolbox, behind the same `bowser_host_layer()`.
