@@ -2,3 +2,4 @@ build/
 third_party
 rex/dev/
 rex-client/dev/
+.DS_Store

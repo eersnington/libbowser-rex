@@ -391,6 +391,34 @@ func (p *plugin) method(raw json.RawMessage) (any, *rpcError) {
 			return nil, errBadRequest(`navigate args: want {"url": "..."}`)
 		}
 		return nil, p.send(b, "navigate", map[string]any{"url": args.URL})
+	case in.Method == "trace_start" || in.Method == "trace_stop":
+		// Chromium's trace covers the whole engine, so any block can ask.
+		var args struct {
+			Categories string `json:"categories,omitempty"`
+			Path       string `json:"path,omitempty"`
+		}
+		if len(in.Args) > 0 {
+			if err := decodeStrict(in.Args, &args); err != nil {
+				return nil, errBadRequest(in.Method + ` args: want {"categories"} or {"path"}`)
+			}
+		}
+		e, err := p.running()
+		if err != nil {
+			return nil, errInternal(err.Error())
+		}
+		cmd := map[string]any{"cmd": in.Method}
+		if args.Categories != "" {
+			cmd["categories"] = args.Categories
+		}
+		if args.Path != "" {
+			cmd["path"] = args.Path
+		}
+		r, err := e.call(cmd)
+		if err != nil {
+			return nil, errBadRequest(err.Error())
+		}
+		delete(r, "id")
+		return r, nil
 	case plainMessages[in.Method]:
 		if err := decodeStrict(in.Args, &struct{}{}); err != nil {
 			return nil, errBadRequest(in.Method + " args: " + err.Error())

@@ -39,6 +39,8 @@ the same `id`. A failed command replies `{"id":…,"error":"…"}`.
 | `{"id":2,"cmd":"ticket","surface":"1"}` | `{"id":2,"ticket":"bowser3:…"}`: a fresh single-use ticket, valid for 60 s. |
 | `{"id":3,"cmd":"close","surface":"1"}` | `{"id":3}`. The surface's host gets `detached_cb(BOWSER_ERR_DISCONNECTED)`. |
 | `{"id":4,"cmd":"message","surface":"1","name":"navigate","body":{"url":"…"}}` | `{"id":4}`. Any message from the vocabulary below. |
+| `{"id":5,"cmd":"trace_start","categories":"…"}` | `{"id":5,"trace_us":…,"mach_us":…}`. Starts Chromium's trace of every engine process. `categories` defaults to a frame-timing set. The trace's clock is mach time in µs: the two values match. |
+| `{"id":6,"cmd":"trace_stop","path":"/abs/trace.json"}` | `{"id":6}`. The file appears at `path` once every process has sent its events. |
 
 Events have no `id`:
 

@@ -14,6 +14,32 @@ rex-client/check-typing.sh          # types into pages like a person, checks wha
 BOWSER_LOG=1 rex-client/run.sh server; rex-client/bench-startup.sh   # docs/perf.md
 ```
 
+## Find a stutter
+
+Run `rex-client/perf-trace.sh 15` while the stutter happens: scroll, play the
+video, or switch to the Rex window's Space. It records four lanes on one
+clock and prints each **spike** (a burst of late or dropped frames) with what
+was busy, what went silent, and the GPU and CPU load meanwhile:
+
+```
+  1.900s  107 ms: 5× tab 13402: dropped frame, 1× tab 13402: presented frames
+     120.2 ms  Renderer / CrRendererMain: RunTask > … > v8.callFunction (jank) > FunctionCall (jank)
+     load: GPU busy %: Chromium GPU process 21, WindowServer 12, other apps 5, Rex client 0
+```
+
+| Lane | Source | Shows |
+|---|---|---|
+| Chromium | engine `trace_start`/`trace_stop` | Each frame from the page's main thread to the GPU process's commit to WindowServer; dropped frames; script and raster |
+| Rex client | `BOWSER_REX_PERF` (`run.sh` sets it) | Main-thread turns of 4 ms or more, pane layouts, mounts, attaches |
+| Rex window | `framegaps.swift` (ScreenCaptureKit) | Each frame WindowServer composited for the window. Only while it is on the current Space |
+| Load | `sysmon.swift` | GPU busy per process (IOKit) and CPU, every 50 ms. Other apps only as one total |
+
+`dev/perf/<time>/trace.json` opens in [Perfetto](https://ui.perfetto.dev).
+A spike with a slice names its cause. A spike where a process *logged
+nothing* means it was stopped, starved of CPU, or blocked in the kernel.
+A spike only in the Rex window lane is between Chromium and the screen.
+
+
 ## How it works
 
 | Piece | What it does |

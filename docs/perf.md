@@ -239,3 +239,22 @@ first frame. What made the first row small:
 | Chromium started its GPU process for the first page (about 400 ms) | The engine draws a blank page at start, and keeps a page made ahead (the spare) |
 | The client started the `rex` CLI for each ticket (about 25 ms) | A ticket socket in the plugin, with a ticket minted ahead (under 1 ms) |
 | The attach waited for Rex's main thread, which lays the window out for 100 to 200 ms after a pane appears (a terminal pane too) | The pane attaches in the same main-thread turn that mounts it |
+
+## Finding stutter
+
+A screen recording shows that frames were late, not why. `rex-client/perf-trace.sh`
+answers why (see `rex-client/README.md`). It was checked against known causes:
+
+| Cause, planted | What the report named |
+|---|---|
+| Page script blocks for 120 ms every 2 s | Each spike: `FunctionCall (jank)` on the renderer's main thread, 120 ms |
+| GPU process stopped for 150 ms (`SIGSTOP`) | One spike: `GPU Process logged nothing`, 147.6 ms |
+
+On ribbet-is-you at 1400 frogs, the frog tab misses about 1 frame in 200, each
+by one vsync: the page's main thread (4–13 ms) and the GPU process's canvas
+raster (7–12 ms) together exceed 16.7 ms. That is the page's own cost. The
+engine's GPU process ran at 21–36 % GPU busy, so the GPU was not saturated.
+
+Not measured yet: the Rex window lane during a stutter you can see. It needs
+the window on the current Space.
+

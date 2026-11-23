@@ -49,6 +49,22 @@ var creatorList = map[string]any{
 				"forward": plainMethod("Go forward in the page's history."),
 				"reload":  plainMethod("Reload the page."),
 				"stop":    plainMethod("Stop loading the page."),
+				"trace_start": map[string]any{
+					"description": "Start Chromium's trace of the whole engine. Returns its clock against mach time, in microseconds.",
+					"input_schema": obj(map[string]any{
+						"categories": map[string]any{"type": "string", "description": "Chromium trace categories; a frame-timing set if left out."},
+					}),
+					"output_schema": obj(map[string]any{
+						"trace_us": map[string]any{"type": "number"},
+						"mach_us":  map[string]any{"type": "number"},
+					}, "trace_us", "mach_us"),
+				},
+				"trace_stop": map[string]any{
+					"description": "Stop the trace. The engine writes it to path; the file appears when it is complete.",
+					"input_schema": obj(map[string]any{
+						"path": map[string]any{"type": "string", "description": "An absolute path for the JSON trace."},
+					}, "path"),
+				},
 			},
 			"events": map[string]any{
 				"state": obj(stateProps(nil)),

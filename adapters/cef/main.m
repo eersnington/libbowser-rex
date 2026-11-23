@@ -36,9 +36,12 @@
 #include <stdatomic.h>
 
 #include "engine.h"
+#include <mach/mach_time.h>
+
 #include "include/capi/cef_app_capi.h"
 #include "include/capi/cef_client_capi.h"
 #include "include/capi/cef_command_line_capi.h"
+#include "include/capi/cef_trace_capi.h"
 #include "include/capi/cef_context_menu_handler_capi.h"
 #include "include/capi/cef_dialog_handler_capi.h"
 #include "include/capi/cef_display_handler_capi.h"
@@ -120,6 +123,7 @@ static struct {
   NSMutableData *line;
   NSMutableDictionary<NSNumber *, id> *menus; // open menus by id
   int nextMenu;
+  NSString *tracePath; // trace_stop's destination while CEF writes it
 } E;
 
 bool engine_log_enabled(void) {
@@ -1608,6 +1612,53 @@ static bool default_windowed(bowser_transport_e transport) {
   return transport == BOWSER_TRANSPORT_CALAYERHOST && !E.osrOnly;
 }
 
+// ---- Tracing ----------------------------------------------------------
+// Chromium's own trace of every process, for finding where a frame was late.
+// CEF writes it to a temporary name; the rename marks it complete.
+
+static void CEF_CALLBACK on_end_tracing_complete(cef_end_tracing_callback_t *self, const cef_string_t *file) {
+  NSString *tmp = ns_str(file);
+  if (E.tracePath) rename(tmp.fileSystemRepresentation, E.tracePath.fileSystemRepresentation);
+  E.tracePath = nil;
+}
+
+static cef_end_tracing_callback_t end_tracing_callback = {
+    STATIC_BASE(cef_end_tracing_callback_t),
+    .on_end_tracing_complete = on_end_tracing_complete,
+};
+
+static const char *kTraceCategories =
+    "toplevel,benchmark,cc,viz,gpu,gpu.service,input,blink,latencyInfo,devtools.timeline,v8,"
+    "disabled-by-default-devtools.timeline,disabled-by-default-devtools.timeline.frame,"
+    "disabled-by-default-viz.quads";
+
+static NSDictionary *trace_command(NSString *name, NSDictionary *cmd) {
+  if ([name isEqualToString:@"trace_start"]) {
+    id cats = cmd[@"categories"];
+    cef_string_t c = cef_str([cats isKindOfClass:NSString.class] ? [cats UTF8String] : kTraceCategories);
+    int ok = cef_begin_tracing(&c, NULL);
+    cef_string_clear(&c);
+    if (!ok) return @{@"error" : @"tracing is already on"};
+    // The trace's clock against mach time, so other processes' events line up.
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    double mach_us = (double)mach_absolute_time() * tb.numer / tb.denom / 1000;
+    return @{@"trace_us" : @(cef_now_from_system_trace_time()), @"mach_us" : @(mach_us)};
+  }
+  id path = cmd[@"path"];
+  if (![path isKindOfClass:NSString.class] || ![path isAbsolutePath]) return @{@"error" : @"trace_stop needs an absolute path"};
+  NSString *tmp = [path stringByAppendingString:@".part"];
+  cef_string_t f = cef_str([tmp UTF8String]);
+  E.tracePath = path;
+  int ok = cef_end_tracing(&f, &end_tracing_callback);
+  cef_string_clear(&f);
+  if (!ok) {
+    E.tracePath = nil;
+    return @{@"error" : @"tracing is off"};
+  }
+  return @{};
+}
+
 static NSDictionary *run_command(NSDictionary *cmd) {
   NSString *name = cmd[@"cmd"];
   if (![name isKindOfClass:NSString.class]) return @{@"error" : @"no cmd"};
@@ -1628,6 +1679,7 @@ static NSDictionary *run_command(NSDictionary *cmd) {
     if (t && t->windowed) windowed_await_host(t);
     return t ? @{@"surface" : t->sid, @"mode" : windowed ? @"windowed" : @"osr"} : @{@"error" : error};
   }
+  if ([name isEqualToString:@"trace_start"] || [name isEqualToString:@"trace_stop"]) return trace_command(name, cmd);
   id sid = cmd[@"surface"];
   Tab *t = [sid isKindOfClass:NSString.class] ? E.tabs[sid] : nil;
   if (!t || !t->surface) return @{@"error" : [NSString stringWithFormat:@"no surface %@", sid]};

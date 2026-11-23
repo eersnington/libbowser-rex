@@ -78,9 +78,7 @@ func fetchTicket(blockID: String, now: Bool = false, completion: @escaping (Stri
   // Dev hook: a fixed ticket, to test mounting without the server plugin.
   if let fixed = env["BOWSER_REX_TICKET"] { return DispatchQueue.main.async { completion(fixed) } }
   if let path = env["BOWSER_REX_TICKETS"] {
-    let tmpT = CACurrentMediaTime()
     if now, let ticket = askTicketSocket(path, blockID: blockID, waitMs: 20) {
-      rexTrace(String(format: "TMP ticket %.2f ms", (CACurrentMediaTime() - tmpT) * 1000))
       return completion(ticket)
     }
     return DispatchQueue.global(qos: .userInteractive).async {
@@ -286,9 +284,9 @@ final class BowserPaneView: NSView, NSTextInputClient {
         view.detach()
       }
       var h: OpaquePointer?
-      let tmpA = CACurrentMediaTime()
+      let attachStart = Perf.now()
       let rc = bowser_host_attach(ticket, &cfg, &h)
-      rexTrace(String(format: "TMP host_attach %.2f ms", (CACurrentMediaTime() - tmpA) * 1000))
+      Perf.slice("bowser_host_attach", from: attachStart)
       guard rc == BOWSER_OK, let h else {
         rexTrace("block \(self.blockID): attach failed: \(String(cString: bowser_last_error()))")
         // A used or expired ticket: ask the block for a fresh one.
@@ -642,11 +640,6 @@ private var mountKey: UInt8 = 0
 /// Called after every NativePaneView layout. Costs about 0.1 ms (measured
 /// over 50 calls while resizing splits), so it can run on every layout.
 func reconcilePane(_ pane: NSView) {
-  let tmpT0 = CACurrentMediaTime()
-  defer {
-    let ms = (CACurrentMediaTime() - tmpT0) * 1000
-    if ms > 0.5 { rexTrace(String(format: "TMP reconcile %.2f ms", ms)) }
-  }
   let mounted = objc_getAssociatedObject(pane, &mountKey) as? BowserPaneView
   let block = paneBlock(pane)
   let wanted = block?.creator == creatorName ? block : nil
@@ -667,9 +660,7 @@ func reconcilePane(_ pane: NSView) {
   if let existing = objc_getAssociatedObject(pane, &mountKey) as? BowserPaneView {
     view = existing
   } else {
-    let tmpT0 = CACurrentMediaTime()
     view = BowserPaneView(blockID: wanted.blockID)
-    rexTrace(String(format: "TMP init %.2f ms", (CACurrentMediaTime() - tmpT0) * 1000))
     objc_setAssociatedObject(pane, &mountKey, view, .OBJC_ASSOCIATION_RETAIN)
     rexTrace("block \(wanted.blockID): mounting (\(wanted.flavor ?? "?")), focus action \(paneFocusAction(pane) != nil ? "found" : "missing")")
   }
@@ -685,9 +676,7 @@ func reconcilePane(_ pane: NSView) {
   if paneIsFocused(pane, blockID: wanted.blockID), let window = view.window,
     !((window.firstResponder as? NSView)?.isDescendant(of: view) ?? false)
   {
-    let tmpF = CACurrentMediaTime()
     window.makeFirstResponder(view)
-    rexTrace(String(format: "TMP focus %.2f ms", (CACurrentMediaTime() - tmpF) * 1000))
     rexTrace("block \(wanted.blockID): took focus from Rex")
   }
 }
@@ -720,17 +709,19 @@ private var originalLayout: IMP?
 /// NSView.layout stays untouched for every other view.
 @_cdecl("rex_bowser_install")
 public func rexBowserInstall() {
-  _ = stallWatch
+  _ = perfWatch
   guard let cls = NSClassFromString(paneClassName) else {
     return rexTrace("no \(paneClassName); Rex changed")
   }
   let sel = #selector(NSView.layout)
   let block: @convention(block) (NSView) -> Void = { pane in
+    let start = Perf.now()
     if let originalLayout {
       typealias Fn = @convention(c) (NSView, Selector) -> Void
       unsafeBitCast(originalLayout, to: Fn.self)(pane, sel)
     }
     reconcilePane(pane)
+    Perf.slice("pane layout", from: start, over: 1000)
   }
   let imp = imp_implementationWithBlock(block)
   let inherited = class_getInstanceMethod(cls, sel)!
@@ -743,6 +734,7 @@ public func rexBowserInstall() {
 }
 
 func rexTrace(_ s: String) {
+  Perf.instant(s)
   guard let path = ProcessInfo.processInfo.environment["BOWSER_REX_TRACE"],
     let f = fopen(path, "a")
   else { return }
@@ -752,17 +744,63 @@ func rexTrace(_ s: String) {
   fclose(f)
 }
 
-// TMP: main-thread probe: logs each ping's delay over 2 ms.
-private let stallWatch: Void = {
-  guard ProcessInfo.processInfo.environment["BOWSER_REX_TRACE"] != nil else { return }
-  let q = DispatchQueue(label: "stalls", qos: .userInteractive)
-  func ping() {
-    let sent = CACurrentMediaTime()
-    DispatchQueue.main.async {
-      let late = (CACurrentMediaTime() - sent) * 1000
-      if late > 2 { rexTrace(String(format: "stall %.1f ms", late)) }
-      q.asyncAfter(deadline: .now() + 0.001) { ping() }
+/// BOWSER_REX_PERF=<file>: Chrome trace events, one JSON object a line, with
+/// `ts` in microseconds of mach time, the clock the engine's trace_start
+/// reports against its own. rex-client/perf-trace.sh merges them into the
+/// engine's trace, so a late frame lines up with what Rex's main thread did.
+enum Perf {
+  static let file: FileHandle? = {
+    guard let path = ProcessInfo.processInfo.environment["BOWSER_REX_PERF"] else { return nil }
+    FileManager.default.createFile(atPath: path, contents: nil)
+    let f = FileHandle(forWritingAtPath: path)
+    f?.seekToEndOfFile()
+    return f
+  }()
+  static let queue = DispatchQueue(label: "perf", qos: .utility)
+  static let pid = ProcessInfo.processInfo.processIdentifier
+  static let timebase: Double = {
+    var tb = mach_timebase_info()
+    mach_timebase_info(&tb)
+    return Double(tb.numer) / Double(tb.denom) / 1000
+  }()
+
+  static func now() -> Double { Double(mach_absolute_time()) * timebase }
+
+  static func write(_ event: [String: Any]) {
+    guard let file else { return }
+    var e = event
+    e["pid"] = pid
+    e["tid"] = pthread_main_np() != 0 ? 1 : 2
+    queue.async {
+      guard let data = try? JSONSerialization.data(withJSONObject: e) else { return }
+      file.write(data + Data("\n".utf8))
     }
   }
-  q.async { ping() }
+
+  /// A slice from `start` to now, if it took at least `over` microseconds.
+  static func slice(_ name: String, from start: Double, over: Double = 0) {
+    guard file != nil else { return }
+    let end = now()
+    if end - start >= over { write(["name": name, "cat": "rex", "ph": "X", "ts": start, "dur": end - start]) }
+  }
+
+  static func instant(_ name: String) {
+    guard file != nil else { return }
+    write(["name": name, "cat": "rex", "ph": "i", "s": "t", "ts": now()])
+  }
+}
+
+/// Each main run loop turn that runs 4 ms or more becomes a slice: the time
+/// Rex's main thread could not lay out, commit, or handle input.
+private let perfWatch: Void = {
+  guard Perf.file != nil else { return }
+  Perf.write(["name": "process_name", "ph": "M", "args": ["name": "Rex client"]])
+  Perf.write(["name": "thread_name", "ph": "M", "args": ["name": "main"]])
+  var woke = Perf.now()
+  let observer = CFRunLoopObserverCreateWithHandler(
+    nil, CFRunLoopActivity.afterWaiting.rawValue | CFRunLoopActivity.beforeWaiting.rawValue, true, 0
+  ) { _, activity in
+    if activity == .afterWaiting { woke = Perf.now() } else { Perf.slice("main thread busy", from: woke, over: 4000) }
+  }
+  CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
 }()

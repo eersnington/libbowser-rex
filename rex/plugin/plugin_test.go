@@ -367,3 +367,67 @@ func TestTheEngineOutlivesTheLastBlock(t *testing.T) {
 		t.Fatalf("the next block uses the same engine: %v, was %v", after["engine_pid"], before["engine_pid"])
 	}
 }
+
+func TestTraceRecordsThePagesFramesOnTheReportedClock(t *testing.T) {
+	r := startRex(t)
+	anim := "data:text/html," + url.PathEscape(`<title>Anim</title><div id=b style="width:50px;height:50px;background:red"></div>`+
+		`<script>function f(t){b.style.marginLeft=(t/5%300)+"px";requestAnimationFrame(f)}requestAnimationFrame(f)</script>`)
+	// A windowed tab renders without a host for its first 3 s, as if Rex
+	// were about to mount it; an OSR tab with no host draws nothing.
+	b := r.createWith("block:a", map[string]any{"url": anim, "transport": "calayerhost"})
+	r.event(b, "state", titled("Anim"))
+	out := filepath.Join(t.TempDir(), "trace.json")
+
+	if _, err := r.method(b, "trace_stop", map[string]any{"path": out}); err == nil {
+		t.Fatal("stopping a trace that never started is an error")
+	}
+	clock, err := r.method(b, "trace_start", nil)
+	if err != nil {
+		t.Fatalf("trace_start: %v", err)
+	}
+	time.Sleep(time.Second)
+	if _, err := r.method(b, "trace_stop", map[string]any{"path": out}); err != nil {
+		t.Fatalf("trace_stop: %v", err)
+	}
+	var data []byte
+	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		var readErr error
+		if data, readErr = os.ReadFile(out); readErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the engine writes the trace to the path it was given")
+		}
+	}
+	var trace struct {
+		TraceEvents []struct {
+			Name string          `json:"name"`
+			Ph   string          `json:"ph"`
+			Ts   float64         `json:"ts"`
+			Args json.RawMessage `json:"args"`
+		} `json:"traceEvents"`
+	}
+	if jsonErr := json.Unmarshal(data, &trace); jsonErr != nil {
+		t.Fatalf("the trace is complete JSON: %v", jsonErr)
+	}
+	// perf-trace.sh lines the trace up with other processes' mach time as is.
+	start := clock["mach_us"].(float64)
+	presented, reporters, lo, hi := 0, 0, 0.0, 0.0
+	for _, e := range trace.TraceEvents {
+		if e.Name == "PipelineReporter" && e.Ph == "b" {
+			reporters++
+			if lo == 0 || e.Ts < lo {
+				lo = e.Ts
+			}
+			hi = max(hi, e.Ts)
+		}
+		if e.Name == "PipelineReporter" && e.Ph == "b" && strings.Contains(string(e.Args), "STATE_PRESENTED") &&
+			e.Ts >= start && e.Ts <= start+3e6 {
+			presented++
+		}
+	}
+	if presented < 20 {
+		t.Fatalf("1 s of an animating page shows at least 20 presented frames, in mach time, got %d "+
+			"(%d frames from %.0f to %.0f µs; trace started at %.0f)", presented, reporters, lo, hi, start)
+	}
+}
