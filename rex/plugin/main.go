@@ -45,6 +45,10 @@ func main() {
 	}
 
 	p := newPlugin()
+	go p.warm()
+	if path := os.Getenv("BOWSER_TICKET_SOCKET"); path != "" {
+		go p.serveTickets(path)
+	}
 	cleanup := func() {
 		p.closeAll()
 		os.RemoveAll(dir)

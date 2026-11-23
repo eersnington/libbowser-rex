@@ -10,6 +10,7 @@
 //    (RexBowser.swift).
 // 4. Dumps the view tree to BOWSER_REX_DUMP on SIGUSR1, to find where Rex
 //    draws blocks.
+#include <sys/time.h>
 #import <AppKit/AppKit.h>
 
 #include <dlfcn.h>
@@ -33,6 +34,9 @@ static void trace(const char *fmt, ...) {
   if (!path) return;
   FILE *f = fopen(path, "a");
   if (!f) return;
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  fprintf(f, "%ld.%06d ", (long)tv.tv_sec, (int)tv.tv_usec);
   va_list ap;
   va_start(ap, fmt);
   vfprintf(f, fmt, ap);
@@ -214,15 +218,23 @@ static void play_keys(void) {
   const char *path = getenv("BOWSER_REX_KEYS");
   NSWindow *w = NSApp.keyWindow ?: NSApp.mainWindow ?: NSApp.orderedWindows.firstObject;
   if (!path || !w) return;
-  NSDictionary *codes = @{@"l" : @37, @"f" : @3, @"r" : @15, @"g" : @5, @"c" : @8, @"v" : @9, @"a" : @0,
-                          @"=" : @24, @"-" : @27, @"0" : @29};
+  // US layout key codes, so pages see the key a keyboard would send.
+  NSDictionary *codes = @{
+    @"a" : @0,  @"s" : @1,  @"d" : @2,  @"f" : @3,  @"h" : @4,  @"g" : @5,  @"z" : @6,  @"x" : @7,  @"c" : @8,
+    @"v" : @9,  @"b" : @11, @"q" : @12, @"w" : @13, @"e" : @14, @"r" : @15, @"y" : @16, @"t" : @17, @"1" : @18,
+    @"2" : @19, @"3" : @20, @"4" : @21, @"6" : @22, @"5" : @23, @"=" : @24, @"9" : @25, @"7" : @26, @"-" : @27,
+    @"8" : @28, @"0" : @29, @"o" : @31, @"u" : @32, @"i" : @34, @"p" : @35, @"l" : @37, @"j" : @38, @"k" : @40,
+    @"n" : @45, @"m" : @46, @"." : @47, @"/" : @44, @" " : @49, @"," : @43, @";" : @41, @"'" : @39};
   NSString *all = [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:nil];
   for (NSString *line in [all componentsSeparatedByString:@"\n"]) {
     if (!line.length) continue;
     trace("key %s", line.UTF8String);
     if ([line hasPrefix:@"type:"]) {
       NSString *text = [line substringFromIndex:5];
-      for (NSUInteger i = 0; i < text.length; i++) send_key(w, [text substringWithRange:NSMakeRange(i, 1)], 0, 0);
+      for (NSUInteger i = 0; i < text.length; i++) {
+        NSString *ch = [text substringWithRange:NSMakeRange(i, 1)];
+        send_key(w, ch, [codes[ch.lowercaseString] unsignedShortValue], 0);
+      }
     } else if ([line isEqualToString:@"enter"]) {
       send_key(w, @"\r", 36, 0);
     } else if ([line isEqualToString:@"esc"]) {

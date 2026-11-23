@@ -10,6 +10,8 @@ rex-client/run.sh client            # injected dev client; windows go to Space 3
 kill -USR2 "$(cat rex-client/dev/client.pid)"   # open its window, without activating
 rex-client/dev/rexdev ...           # the rex CLI, pointed at the dev server
 rex-client/run.sh stop
+rex-client/check-typing.sh          # types into pages like a person, checks what they got
+BOWSER_LOG=1 rex-client/run.sh server; rex-client/bench-startup.sh   # docs/perf.md
 ```
 
 ## How it works
@@ -25,6 +27,8 @@ rex-client/run.sh stop
 | `BrowserChrome.swift` | The pane's native chrome: an address bar (⌘L), a find bar (⌘F), and a loading line. They float over the page, so showing them never resizes it. |
 
 ## Keys in a browser pane
+
+⇧⌘B in any pane opens a new browser pane beside it (see `rex/README.md`).
 
 Rex consumes its menu shortcuts before views see them, so the injected
 library checks keys in `NSApplication.sendEvent` first, and only while the

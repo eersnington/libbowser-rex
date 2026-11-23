@@ -16,6 +16,8 @@ var creatorList = map[string]any{
 				"url": map[string]any{"type": "string", "description": "The page to open, as typed into an address bar."},
 				"transport": map[string]any{"type": "string", "enum": []string{"calayerhost", "iosurface"},
 					"description": "How frames reach the host. Defaults to calayerhost."},
+				"mode": map[string]any{"type": "string", "enum": []string{"windowed", "osr"},
+					"description": "How the engine renders: windowed (zero copy, calayerhost only) or osr. Defaults to the engine's choice for the transport."},
 			}),
 		}},
 		"api": map[string]any{

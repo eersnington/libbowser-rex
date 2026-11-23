@@ -91,7 +91,7 @@ static void swizzle(Class cls, SEL sel, IMP imp, IMP *orig) {
 // Its own occlusion checker sets isOccluded (a category on NSWindow) for
 // windows on screen; this one never is, so it answers whether a host shows
 // the tab instead.
-- (BOOL)isOccluded { return !(tab && tab->attached); }
+- (BOOL)isOccluded { return !(tab && (tab->attached || tab->awaitingHost)); }
 - (NSWindowOcclusionState)occlusionState { return self.isOccluded ? 0 : NSWindowOcclusionStateVisible; }
 // CEF closes a windowed browser by closing its top-level window; a borderless
 // window has no close button, so performClose: would only beep. The browser
@@ -538,9 +538,11 @@ static void interpret_keys(NSView<NSTextInputClient> *view, NSEvent *e);
     replay(t, (NSView<NSTextInputClient> *)self.client);
     return YES;
   }
-  // No text from the host: Return, arrows, Delete, chords. AppKit's key
-  // bindings turn them into commands (insertNewline:, deleteBackward:...),
-  // which need no IME.
+  // No text with this press: Return, arrows, Delete, chords, or a press
+  // whose text is still on its way. AppKit's key bindings turn the first
+  // kind into commands (insertNewline:, deleteBackward:...). Text is never
+  // made from the press itself: the host's IME sends it, and a late text
+  // replays on its own (flush_key), so making it here would type it twice.
   interpret_keys((NSView<NSTextInputClient> *)self.client, event);
   return YES;
 }
@@ -556,12 +558,8 @@ static void interpret_keys(NSView<NSTextInputClient> *view, NSEvent *e);
 @end
 
 // NSResponder's interpretKeyEvents: without the input context: straight to
-// the key bindings.
+// the key bindings. Commands only; text comes from the host (see above).
 static void interpret_keys(NSView<NSTextInputClient> *view, NSEvent *e) {
-  // Characters with no command binding are text, as AppKit would insert.
-  NSString *chars = e.characters;
-  unichar c = chars.length ? [chars characterAtIndex:0] : 0;
-  bool command = e.modifierFlags & (NSEventModifierFlagControl | NSEventModifierFlagCommand);
   bool shift = e.modifierFlags & NSEventModifierFlagShift, option = e.modifierFlags & NSEventModifierFlagOption;
   SEL sel = NULL;
   switch (e.keyCode) {
@@ -580,8 +578,6 @@ static void interpret_keys(NSView<NSTextInputClient> *view, NSEvent *e) {
   case 121: sel = @selector(scrollPageDown:); break;
   }
   if (sel) [view doCommandBySelector:sel];
-  else if (!command && c >= 0x20 && (c < 0xF700 || c > 0xF8FF))
-    [view insertText:chars replacementRange:NSMakeRange(NSNotFound, 0)];
 }
 
 static IMP orig_inputContext;
@@ -642,8 +638,14 @@ static void flush_key(Tab *t) {
   NSEvent *down = w->pendingKeyDown;
   w->pendingKeyDown = nil;
   if (!v) return;
-  if (down) [v keyDown:down];
-  else if (w->textOps.count) replay(t, (NSView<NSTextInputClient> *)v); // emoji picker, dictation, a commit by mouse
+  if (down) {
+    [v keyDown:down];
+    // Text the press brought and Chromium didn't take was for no text field:
+    // with text input off, Chromium skips the input context and makes the
+    // key's own characters. Kept, it would type into whatever has focus
+    // next (a page's "/" shortcut focuses a search field, then cancels it).
+    [w->textOps removeAllObjects];
+  } else if (w->textOps.count) replay(t, (NSView<NSTextInputClient> *)v); // emoji picker, dictation, a commit by mouse
   push_caret(t);
   // The renderer reports the new caret and composition bounds a moment later.
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
@@ -660,6 +662,13 @@ static void queue_flush(Tab *t) {
   dispatch_async(dispatch_get_main_queue(), ^{
     if (t->win) flush_key(t);
   });
+}
+
+static bool types_text(NSEvent *e) {
+  if (e.modifierFlags & (NSEventModifierFlagControl | NSEventModifierFlagCommand)) return false;
+  NSString *chars = e.characters;
+  unichar c = chars.length ? [chars characterAtIndex:0] : 0;
+  return c >= 0x20 && c != 0x7F && (c < 0xF700 || c > 0xF8FF);
 }
 
 void windowed_key(Tab *t, const bowser_key_s *k) {
@@ -683,7 +692,12 @@ void windowed_key(Tab *t, const bowser_key_s *k) {
     return;
   }
   t->win->pendingKeyDown = e;
-  queue_flush(t);
+  // A press that types waits for its text, which the host's IME sends after
+  // it, so the text goes in inside keyDown: as AppKit does it. Chromium drops
+  // text that comes alone right after a press that typed nothing. The host
+  // sends the text before the release, so the release or the next press
+  // ends the wait even when the IME eats the key.
+  if (!types_text(e) || t->win->textOps.count) queue_flush(t);
 }
 
 void windowed_text(Tab *t, const bowser_text_s *in) {
@@ -852,8 +866,26 @@ void windowed_focus(Tab *t, bool focused) {
   [t->win->window makeFirstResponder:v];
 }
 
+static void post_occlusion(Tab *t);
+
+void windowed_await_host(Tab *t) {
+  t->awaitingHost = true;
+  post_occlusion(t);
+  // A host that never comes stops the drawing after a while.
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    if (!t->awaitingHost || !t->win) return;
+    t->awaitingHost = false;
+    post_occlusion(t);
+  });
+}
+
 void windowed_attach(Tab *t, bool attached) {
+  t->awaitingHost = false;
   if (!attached) set_key(t, false);
+  post_occlusion(t);
+}
+
+static void post_occlusion(Tab *t) {
   // A tab no one shows is hidden (see occlusionState): Chromium stops drawing
   // and throttles it. Hiding its view instead leaves it unable to take focus.
   // Chromium only heeds the notification from its occlusion checker.
@@ -872,7 +904,7 @@ void windowed_created(Tab *t) {
   NSView *bv = browser_view(t);
   bv.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
   bv.frame = t->win->window.contentView.bounds;
-  windowed_attach(t, t->attached);
+  post_occlusion(t);
   if (t->focused) windowed_focus(t, true);
 }
 
@@ -886,3 +918,4 @@ void windowed_closed(Tab *t) {
   [CATransaction commit];
   t->win = nil;
 }
+

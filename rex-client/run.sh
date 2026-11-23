@@ -15,7 +15,14 @@ space="${SPACE:-3}"
 srv="$HOME/Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS/rex"
 app="${REX_DEV_APP:-$dev/Rex Bowser Dev.app}"
 mkdir -p "$dev/home" "$dev/state"
-touch "$dev/init.lua"
+# The dev config loads the repo's browser actions (rex/browser.lua).
+printf 'dofile("%s")\n' "$here/../rex/browser.lua" > "$dev/init.lua"
+
+# Every dev client, by its path: a pid file misses one started by hand.
+stop_clients() {
+  pkill -f "$app/Contents/MacOS/Rex" 2>/dev/null || true
+  while pgrep -f "$app/Contents/MacOS/Rex" > /dev/null; do sleep 0.1; done
+}
 
 build() {
   clang -O2 "$here/launch.c" -o "$dev/launch"
@@ -57,17 +64,21 @@ server)
   # the setuid /usr/bin/login that shells use. REX_* from a shell inside the
   # user's Rex name the real server; the plugin and its shells must not see them.
   env -u REX_SERVER -u REX_SESSION -u REX_BLOCK -u REX_CLIENT \
-    HOME="$dev/home" REX_CONFIG="$dev/init.lua" REXPLUGIN_LOG="$dev/logs/plugin.log" \
+    HOME="$dev/home" REX_CONFIG="$dev/init.lua" REXPLUGIN_LOG="$dev/logs/plugin.log" BOWSER_TICKET_SOCKET="$dev/tickets.sock" \
     BOWSER_ENGINE="${BOWSER_ENGINE:-$here/../build/bowser-cef.app/Contents/MacOS/bowser-cef}" "$srv" server run \
     --listen "unix://$dev/s.sock" --state-dir "$dev/state" --config "$dev/init.lua" --restore=false \
     --block-dir "$dev/blocks" < /dev/null > "$dev/server.log" 2>&1 &
   echo $! > "$dev/server.pid"
   ;;
 client)
+  # Two dev clients would both mount every pane and take the page from each
+  # other, so a new one replaces any that is running.
+  stop_clients
   build
   make_app
   rm -f "$dev/trace.log"
   REX_SERVER="unix://$dev/s.sock" BOWSER_REX_CLI="$(command -v rex)" BOWSER_REX_SOCKET="$dev/s.sock" BOWSER_SPACE="$space" \
+    BOWSER_REX_TICKETS="$dev/tickets.sock" \
     BOWSER_REX_TRACE="$dev/trace.log" BOWSER_REX_DUMP="$dev/views.txt" BOWSER_REX_KEYS="$dev/keys.txt" \
     DYLD_INSERT_LIBRARIES="$dev/rexinject.dylib" \
     "$dev/launch" "$here/sandbox.sb" "$app/Contents/MacOS/Rex" < /dev/null > "$dev/client.log" 2>&1 &
@@ -90,6 +101,7 @@ stop)
     [ -f "$dev/$f.pid" ] && kill "$(cat "$dev/$f.pid")" 2>/dev/null || true
     rm -f "$dev/$f.pid"
   done
+  stop_clients
   ;;
 *)
   echo "usage: $0 {server|client|stop}" >&2

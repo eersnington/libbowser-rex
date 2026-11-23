@@ -105,6 +105,7 @@ static NSString *ns_str(const cef_string_t *s) {
 static struct {
   bool control;      // JSON lines on stdin/stdout
   bool contextReady; // CEF can create browsers
+  Tab *spare;        // a windowed tab with no page yet, made ahead (take_spare)
   bool quitting;
   bool osrOnly; // --mode osr: CALAYERHOST tabs render off screen too
   int ticking;  // inside bowser_producer_tick
@@ -567,6 +568,7 @@ static void CEF_CALLBACK on_title_change(cef_display_handler_t *self, cef_browse
   unref(browser);
   if (!t) return;
   t->title = ns_str(title);
+  ENGINE_LOG("%s: title %s\n", t->sid.UTF8String, t->title.UTF8String);
   state_changed(t);
 }
 
@@ -762,6 +764,15 @@ static bool flag(NSDictionary *body, NSString *key, bool fallback) {
 
 // Act on one message. Returns an error, or nil.
 static NSString *handle_message(Tab *t, NSString *name, NSDictionary *body) {
+  if (!t->browser && [name isEqualToString:@"navigate"]) {
+    // CEF is still making the browser: it loads this instead, once made.
+    id typed = body[@"url"];
+    NSString *url = [typed isKindOfClass:NSString.class] ? fixup_url(typed) : nil;
+    if (!url) return @"navigate needs a url";
+    t->url = t->startURL = url;
+    if (t->started) t->loadOnCreate = true;
+    return nil;
+  }
   if (!t->browser) return @"the page is still starting";
   cef_browser_t *b = t->browser;
   if ([name isEqualToString:@"navigate"]) {
@@ -1042,6 +1053,7 @@ static void on_attach(void *ud, bowser_surface_t *s, bool attached) {
   Tab *t = tab_for_surface(s);
   if (!t) return;
   t->attached = attached;
+  ENGINE_LOG("%s: attached %d\n", t->sid.UTF8String, attached);
   if (!attached) t->focused = false;
   // A host that left can't answer; one that took over never saw the menu.
   dismiss_menus(t);
@@ -1208,6 +1220,43 @@ static Tab *open_tab(NSString *url, bowser_transport_e transport, bool windowed,
   return t;
 }
 
+// A spare tab: a windowed browser with no page, made ahead so an open
+// skips creating one (and, for the first, starting CEF's GPU process).
+// Opening a page in it is one navigation. It is created with no URL, so the
+// page it opens is the first entry in its history.
+static void make_spare(void) {
+  if (E.spare || E.osrOnly || E.quitting || !E.contextReady) return;
+  NSString *error;
+  E.spare = open_tab(@"", BOWSER_TRANSPORT_CALAYERHOST, true, &error);
+  if (!E.spare) ENGINE_LOG("no spare tab: %s\n", error.UTF8String);
+}
+
+static void close_tab(Tab *t);
+
+// Chromium starts its GPU process for the first page that draws, which
+// costs the first real page about 400 ms. Draw a blank page now and close it.
+static void warm_up(void) {
+  NSString *error;
+  Tab *t = open_tab(@"about:blank", BOWSER_TRANSPORT_CALAYERHOST, !E.osrOnly, &error);
+  if (!t) return;
+  NSString *sid = t->sid;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    Tab *w = E.tabs[sid];
+    if (w) close_tab(w);
+  });
+}
+
+static Tab *take_spare(NSString *url) {
+  Tab *t = E.spare;
+  E.spare = nil;
+  if (!t || !t->surface) return nil;
+  t->startURL = t->url = url;
+  if (t->browser) load(t, url);
+  else t->loadOnCreate = true;
+  dispatch_async(dispatch_get_main_queue(), ^{ make_spare(); });
+  return t;
+}
+
 // Hosts learn at once (the surface ends); the browser closes after.
 static void close_tab(Tab *t) {
   if (!t->surface) return;
@@ -1244,6 +1293,10 @@ static void CEF_CALLBACK on_after_created(cef_life_span_handler_t *self, cef_bro
   if (!t->surface) { // closed while CEF was making it
     t->host->close_browser(t->host, 1);
     return;
+  }
+  if (t->loadOnCreate) {
+    t->loadOnCreate = false;
+    load(t, t->url);
   }
   if (t->windowed) return windowed_created(t);
   t->host->was_resized(t->host); // the host may have resized us before now
@@ -1559,6 +1612,7 @@ static NSDictionary *run_command(NSDictionary *cmd) {
   NSString *name = cmd[@"cmd"];
   if (![name isKindOfClass:NSString.class]) return @{@"error" : @"no cmd"};
   if ([name isEqualToString:@"open"]) {
+    ENGINE_LOG("open %s\n", [cmd[@"url"] description].UTF8String);
     bowser_transport_e transport;
     if (!parse_transport(cmd[@"transport"], &transport)) return @{@"error" : @"transport: calayerhost or iosurface"};
     bool windowed = default_windowed(transport);
@@ -1568,13 +1622,17 @@ static NSDictionary *run_command(NSDictionary *cmd) {
     id typed = cmd[@"url"];
     NSString *url = [typed isKindOfClass:NSString.class] ? fixup_url(typed) : nil;
     NSString *error;
-    Tab *t = open_tab(url ?: @"about:blank", transport, windowed, &error);
+    Tab *t = windowed && transport == BOWSER_TRANSPORT_CALAYERHOST ? take_spare(url ?: @"about:blank") : nil;
+    if (!t) t = open_tab(url ?: @"about:blank", transport, windowed, &error);
+    // Whoever opened it is about to attach a host: render the first frame now.
+    if (t && t->windowed) windowed_await_host(t);
     return t ? @{@"surface" : t->sid, @"mode" : windowed ? @"windowed" : @"osr"} : @{@"error" : error};
   }
   id sid = cmd[@"surface"];
   Tab *t = [sid isKindOfClass:NSString.class] ? E.tabs[sid] : nil;
   if (!t || !t->surface) return @{@"error" : [NSString stringWithFormat:@"no surface %@", sid]};
   if ([name isEqualToString:@"ticket"]) {
+    ENGINE_LOG("%s: ticket\n", t->sid.UTF8String);
     char *ticket = bowser_surface_ticket(t->surface);
     NSDictionary *reply = @{@"ticket" : @(ticket)};
     bowser_string_free(ticket);
@@ -1639,6 +1697,8 @@ static void CEF_CALLBACK on_context_initialized(cef_browser_process_handler_t *s
   for (Tab *t in E.pending) start_browser(t);
   [E.pending removeAllObjects];
   if (E.control) {
+    warm_up();
+    make_spare();
     emit(@{@"event" : @"ready", @"pid" : @(getpid())});
     start_control();
   }
@@ -1750,6 +1810,12 @@ int main(int argc, char **argv) {
         .log_severity = LOGSEVERITY_ERROR,
     };
     cef_main_args_t args = {argc, argv};
+    // Before CEF starts: its context can be ready, and make the spare tab,
+    // inside cef_initialize.
+    E.tabs = [NSMutableDictionary new];
+    E.bySurface = [NSMutableDictionary new];
+    E.pending = [NSMutableArray new];
+    E.menus = [NSMutableDictionary new];
     int ok = cef_initialize(&args, &settings, &app, NULL);
     cef_string_clear(&settings.root_cache_path);
     cef_string_clear(&settings.cache_path);
@@ -1762,10 +1828,6 @@ int main(int argc, char **argv) {
 
     E.device = MTLCreateSystemDefaultDevice();
     E.queue = [E.device newCommandQueue];
-    E.tabs = [NSMutableDictionary new];
-    E.bySurface = [NSMutableDictionary new];
-    E.pending = [NSMutableArray new];
-    E.menus = [NSMutableDictionary new];
 
     if (!E.control) {
       NSString *error;

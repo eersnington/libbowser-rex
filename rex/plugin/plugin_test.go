@@ -285,6 +285,11 @@ func TestBlocksShareOneEngineAndStayApart(t *testing.T) {
 		t.Fatalf("a block is zero copy by default, and OSR on iosurface: %v/%v and %v/%v", sb["transport"],
 			sb["mode"], sa["transport"], sa["mode"])
 	}
+	c := r.createWith("block:c", map[string]any{"url": page("Gamma"), "mode": "osr"})
+	r.event(c, "state", titled("Gamma"))
+	if sc, _ := r.method(c, "state", nil); sc["transport"] != "calayerhost" || sc["mode"] != "osr" {
+		t.Fatalf("a block can ask for OSR on calayerhost: %v/%v", sc["transport"], sc["mode"])
+	}
 	if tk, err := r.method(a, "ticket", nil); err != nil || !strings.HasPrefix(tk["ticket"].(string), "bowser3:") {
 		t.Fatalf("ticket: %v %v", tk, err)
 	}
@@ -342,5 +347,23 @@ func TestEngineDeathErrorsEveryBlockAndRecovers(t *testing.T) {
 	after, _ := r.method(a, "state", nil)
 	if after["engine_pid"] == 0.0 || after["engine_pid"] == before["engine_pid"] {
 		t.Fatalf("in a new engine: %v, was %v", after["engine_pid"], pid)
+	}
+}
+
+// Closing the last block keeps the engine, so the next block doesn't wait
+// most of a second for a new one.
+func TestTheEngineOutlivesTheLastBlock(t *testing.T) {
+	r := startRex(t)
+	a := r.create("block:a", page("Alpha"))
+	r.event(a, "state", titled("Alpha"))
+	before, _ := r.method(a, "state", nil)
+	if _, err := r.call("block.close", map[string]any{"block_id": a}); err != nil {
+		t.Fatalf("block.close: %v", err)
+	}
+	b := r.create("block:b", page("Beta"))
+	r.event(b, "state", titled("Beta"))
+	after, _ := r.method(b, "state", nil)
+	if after["engine_pid"] != before["engine_pid"] {
+		t.Fatalf("the next block uses the same engine: %v, was %v", after["engine_pid"], before["engine_pid"])
 	}
 }

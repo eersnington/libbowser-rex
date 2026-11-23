@@ -20,6 +20,8 @@
   bool attached, focused;
   NSString *startURL;
   bool started; // CEF is making, or has made, the browser
+  bool loadOnCreate; // a spare, taken before CEF made its browser: load url then
+  bool awaitingHost; // opened for a host that hasn't attached yet: render as if shown
 
   cef_browser_t *browser;
   cef_browser_host_t *host;
@@ -64,9 +66,15 @@
 @end
 
 bool engine_log_enabled(void);
+#include <sys/time.h>
 #define ENGINE_LOG(...)                                                                                      \
   do {                                                                                                       \
-    if (engine_log_enabled()) fprintf(stderr, "bowser-cef: " __VA_ARGS__);                                   \
+    if (engine_log_enabled()) {                                                                              \
+      struct timeval tv_;                                                                                      \
+      gettimeofday(&tv_, NULL);                                                                                \
+      fprintf(stderr, "%ld.%06d bowser-cef: ", (long)tv_.tv_sec, (int)tv_.tv_usec);                            \
+      fprintf(stderr, __VA_ARGS__);                                                                            \
+    }                                                                                                          \
   } while (0)
 
 // ---- Menus (main.m) ---------------------------------------------------
@@ -100,6 +108,8 @@ void windowed_text(Tab *t, const bowser_text_s *text);
 void windowed_resize(Tab *t);
 void windowed_focus(Tab *t, bool focused);
 void windowed_attach(Tab *t, bool attached);
+// A host is on its way: draw now, so the first frame is ready when it attaches.
+void windowed_await_host(Tab *t);
 void windowed_display(Tab *t, uint32_t display);
 
 #endif

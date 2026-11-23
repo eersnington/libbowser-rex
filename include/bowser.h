@@ -56,7 +56,7 @@ typedef struct {
   bowser_key_action_e action;
   uint16_t keycode;            // macOS virtual key code
   uint64_t mods;               // NSEventModifierFlags
-  const char *text;            // UTF-8 `characters`, may be NULL
+  const char *text;            // UTF-8 `characters`, may be NULL. For shortcuts: text to type goes through bowser_host_text
   const char *unmodified_text; // UTF-8 `charactersIgnoringModifiers`, may be NULL
   uint64_t timestamp_ns;
 } bowser_key_s;

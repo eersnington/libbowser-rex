@@ -68,10 +68,26 @@ func paneIsFocused(_ pane: NSView, blockID: String) -> Bool {
 /// Ask the block for a fresh ticket through the Rex CLI (`ticket` is a method
 /// of the dev.libbowser plugin, rex/plugin). REX_SERVER in this
 /// process already names the right server.
-func fetchTicket(blockID: String, completion: @escaping (String?) -> Void) {
+///
+/// With `now`, a ticket the plugin has ready comes back before this returns,
+/// so the pane attaches in the same main-thread turn that mounts it: Rex lays
+/// out its window for 100 ms or more right after a pane appears, and an
+/// attach that waits for the main thread waits for that.
+func fetchTicket(blockID: String, now: Bool = false, completion: @escaping (String?) -> Void) {
   let env = ProcessInfo.processInfo.environment
   // Dev hook: a fixed ticket, to test mounting without the server plugin.
   if let fixed = env["BOWSER_REX_TICKET"] { return DispatchQueue.main.async { completion(fixed) } }
+  if let path = env["BOWSER_REX_TICKETS"] {
+    let tmpT = CACurrentMediaTime()
+    if now, let ticket = askTicketSocket(path, blockID: blockID, waitMs: 20) {
+      rexTrace(String(format: "TMP ticket %.2f ms", (CACurrentMediaTime() - tmpT) * 1000))
+      return completion(ticket)
+    }
+    return DispatchQueue.global(qos: .userInteractive).async {
+      let ticket = askTicketSocket(path, blockID: blockID, waitMs: 5000)
+      DispatchQueue.main.async { completion(ticket) }
+    }
+  }
   let cli = env["BOWSER_REX_CLI"] ?? "/usr/local/bin/rex"
   let method = env["BOWSER_REX_TICKET_METHOD"] ?? "ticket"
   DispatchQueue.global(qos: .userInitiated).async {
@@ -92,6 +108,43 @@ func fetchTicket(blockID: String, completion: @escaping (String?) -> Void) {
     if ticket == nil { rexTrace("ticket: none in \(String(decoding: data, as: UTF8.self).prefix(200))") }
     DispatchQueue.main.async { completion(ticket) }
   }
+}
+
+/// The plugin's ticket socket (rex/plugin/tickets.go): about 1 ms, where the
+/// CLI takes about 25.
+private func askTicketSocket(_ path: String, blockID: String, waitMs: Int) -> String? {
+  let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+  guard fd >= 0 else { return nil }
+  defer { close(fd) }
+  var limit = timeval(tv_sec: waitMs / 1000, tv_usec: Int32(waitMs % 1000 * 1000))
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &limit, socklen_t(MemoryLayout<timeval>.size))
+  var addr = sockaddr_un()
+  addr.sun_family = sa_family_t(AF_UNIX)
+  let max = MemoryLayout.size(ofValue: addr.sun_path)
+  guard path.utf8.count < max else { return nil }
+  withUnsafeMutableBytes(of: &addr.sun_path) { buf in
+    buf.copyBytes(from: path.utf8)
+    buf[path.utf8.count] = 0
+  }
+  let ok = withUnsafePointer(to: &addr) {
+    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+  }
+  guard ok == 0 else {
+    rexTrace("ticket: can't connect to \(path): \(String(cString: strerror(errno)))")
+    return nil
+  }
+  let line = Array((blockID + "\n").utf8)
+  guard write(fd, line, line.count) == line.count else { return nil }
+  var reply = [UInt8]()
+  var chunk = [UInt8](repeating: 0, count: 512)
+  while !reply.contains(UInt8(ascii: "\n")) {
+    let n = read(fd, &chunk, chunk.count)
+    if n <= 0 { break }
+    reply += chunk[0..<n]
+  }
+  let ticket = findTicket(try? JSONSerialization.jsonObject(with: Data(reply)))
+  if ticket == nil { rexTrace("ticket: none in \(String(decoding: reply, as: UTF8.self).prefix(200))") }
+  return ticket
 }
 
 private func findTicket(_ json: Any?) -> String? {
@@ -117,21 +170,45 @@ final class BowserPaneView: NSView, NSTextInputClient {
   private var cursor = NSCursor.arrow
 
   private(set) var state = BrowserState()
-  private lazy var addressBar = AddressBar(send: { [weak self] in self?.send($0, $1) })
-  private lazy var findBar = FindBar(send: { [weak self] in self?.send($0, $1) })
-  private let progressLine = ProgressLine()
+  // The chrome is made on first use: building it (an NSSearchField, effect
+  // views) costs more than the rest of mounting a pane.
+  private var addressBarIfMade: AddressBar?
+  private var findBarIfMade: FindBar?
+  private var progressLineIfMade: ProgressLine?
+  private var addressBar: AddressBar {
+    if let b = addressBarIfMade { return b }
+    let b = AddressBar(send: { [weak self] in self?.send($0, $1) })
+    b.onDismiss = { [weak self, weak b] in self?.dismiss(b) }
+    addressBarIfMade = b
+    addBar(b)
+    return b
+  }
+  private var findBar: FindBar {
+    if let b = findBarIfMade { return b }
+    let b = FindBar(send: { [weak self] in self?.send($0, $1) })
+    b.onDismiss = { [weak self, weak b] in self?.dismiss(b) }
+    findBarIfMade = b
+    addBar(b)
+    return b
+  }
+  private var progressLine: ProgressLine {
+    if let l = progressLineIfMade { return l }
+    let l = ProgressLine()
+    progressLineIfMade = l
+    addSubview(l)
+    layoutChrome()
+    return l
+  }
+  private func addBar(_ bar: NSView) {
+    bar.isHidden = true
+    addSubview(bar)
+    layoutChrome()
+  }
 
   init(blockID: String) {
     self.blockID = blockID
     super.init(frame: .zero)
     wantsLayer = true
-    for bar in [addressBar, findBar] as [NSView] {
-      bar.isHidden = true
-      addSubview(bar)
-    }
-    addSubview(progressLine)
-    addressBar.onDismiss = { [weak self] in self?.dismiss(self?.addressBar) }
-    findBar.onDismiss = { [weak self] in self?.dismiss(self?.findBar) }
     addTrackingArea(NSTrackingArea(
       rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
       owner: self))
@@ -150,7 +227,22 @@ final class BowserPaneView: NSView, NSTextInputClient {
 
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
-    if window == nil { detach() } else { attach() }
+    NotificationCenter.default.removeObserver(self, name: NSWindow.didChangeScreenNotification, object: nil)
+    if let window {
+      NotificationCenter.default.addObserver(
+        self, selector: #selector(screenChanged), name: NSWindow.didChangeScreenNotification, object: window)
+      attach()
+    } else {
+      detach()
+    }
+  }
+
+  /// The engine puts its hidden window on this display, so the page renders
+  /// at its scale and refresh rate.
+  @objc private func screenChanged() {
+    guard let host, let number = window?.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+    else { return }
+    bowser_host_set_display(host, number.uint32Value)
   }
 
   private func attach() {
@@ -162,7 +254,7 @@ final class BowserPaneView: NSView, NSTextInputClient {
   /// A producer that is still starting has no ticket yet (CEF takes about a
   /// second), so retry with backoff for up to ~15 s.
   private func requestTicket(attempt: Int) {
-    fetchTicket(blockID: blockID) { [weak self] ticket in
+    fetchTicket(blockID: blockID, now: attempt == 0) { [weak self] ticket in
       guard let self else { return }
       guard self.window != nil, self.host == nil else { self.attaching = false; return }
       guard let ticket else {
@@ -194,7 +286,9 @@ final class BowserPaneView: NSView, NSTextInputClient {
         view.detach()
       }
       var h: OpaquePointer?
+      let tmpA = CACurrentMediaTime()
       let rc = bowser_host_attach(ticket, &cfg, &h)
+      rexTrace(String(format: "TMP host_attach %.2f ms", (CACurrentMediaTime() - tmpA) * 1000))
       guard rc == BOWSER_OK, let h else {
         rexTrace("block \(self.blockID): attach failed: \(String(cString: bowser_last_error()))")
         // A used or expired ticket: ask the block for a fresh one.
@@ -206,7 +300,13 @@ final class BowserPaneView: NSView, NSTextInputClient {
       }
       self.host = h
       self.sentSize = nil
+      self.screenChanged()
+      CATransaction.begin()
+      // Runs once the window's transaction with the page in it is committed
+      // to the render server: when the page can first be on screen.
+      CATransaction.setCompletionBlock { [blockID = self.blockID] in rexTrace("block \(blockID): committed") }
       self.layer?.addSublayer(bowser_host_layer(h))
+      CATransaction.commit()
       self.needsLayout = true
       rexTrace("block \(self.blockID): attached")
     }
@@ -245,11 +345,11 @@ final class BowserPaneView: NSView, NSTextInputClient {
 
   private func layoutChrome() {
     let inset: CGFloat = 8, height: CGFloat = 34
-    progressLine.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 2)
+    progressLineIfMade?.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 2)
     let addressWidth = min(bounds.width - 2 * inset, 720)
-    addressBar.frame = NSRect(x: (bounds.width - addressWidth) / 2, y: inset, width: addressWidth, height: height)
+    addressBarIfMade?.frame = NSRect(x: (bounds.width - addressWidth) / 2, y: inset, width: addressWidth, height: height)
     let findWidth = min(bounds.width - 2 * inset, 380)
-    findBar.frame = NSRect(x: bounds.width - findWidth - inset, y: inset, width: findWidth, height: height)
+    findBarIfMade?.frame = NSRect(x: bounds.width - findWidth - inset, y: inset, width: findWidth, height: height)
   }
 
   private func send(_ name: String, _ body: [String: Any]?) {
@@ -267,15 +367,15 @@ final class BowserPaneView: NSView, NSTextInputClient {
     case "state":
       guard let s = BrowserState(json: body) else { return }
       state = s
-      addressBar.update(s)
-      progressLine.update(loading: s.loading, progress: s.progress)
+      addressBarIfMade?.update(s)
+      if s.loading || progressLineIfMade != nil { progressLine.update(loading: s.loading, progress: s.progress) }
     case "menu":
       showMenu(body)
     case "find_result":
       guard let data = body?.data(using: .utf8),
         let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
       else { return }
-      findBar.update(count: o["count"] as? Int ?? 0, active: o["active"] as? Int ?? 0)
+      findBarIfMade?.update(count: o["count"] as? Int ?? 0, active: o["active"] as? Int ?? 0)
     default:
       break
     }
@@ -336,7 +436,7 @@ final class BowserPaneView: NSView, NSTextInputClient {
   private func show(_ bar: NSView) {
     bar.isHidden = false
     layoutChrome()
-    if bar === addressBar { addressBar.update(state); addressBar.focus() } else { findBar.focus() }
+    if let a = bar as? AddressBar { a.update(state); a.focus() } else if let f = bar as? FindBar { f.focus() }
   }
 
   private func dismiss(_ bar: NSView?) {
@@ -371,8 +471,8 @@ final class BowserPaneView: NSView, NSTextInputClient {
     case ([.command], "l"): show(addressBar)
     case ([.command], "r"), ([.command, .shift], "r"): send("reload", nil)
     case ([.command], "f"): show(findBar)
-    case ([.command], "g"): findBar.findNext()
-    case ([.command, .shift], "g"): findBar.findPrevious()
+    case ([.command], "g"): findBarIfMade?.findNext()
+    case ([.command, .shift], "g"): findBarIfMade?.findPrevious()
     case ([.command], "="), ([.command], "+"), ([.command, .shift], "="), ([.command, .shift], "+"):
       send("zoom", ["delta": 1])
     case ([.command], "-"): send("zoom", ["delta": -1])
@@ -542,6 +642,11 @@ private var mountKey: UInt8 = 0
 /// Called after every NativePaneView layout. Costs about 0.1 ms (measured
 /// over 50 calls while resizing splits), so it can run on every layout.
 func reconcilePane(_ pane: NSView) {
+  let tmpT0 = CACurrentMediaTime()
+  defer {
+    let ms = (CACurrentMediaTime() - tmpT0) * 1000
+    if ms > 0.5 { rexTrace(String(format: "TMP reconcile %.2f ms", ms)) }
+  }
   let mounted = objc_getAssociatedObject(pane, &mountKey) as? BowserPaneView
   let block = paneBlock(pane)
   let wanted = block?.creator == creatorName ? block : nil
@@ -562,7 +667,9 @@ func reconcilePane(_ pane: NSView) {
   if let existing = objc_getAssociatedObject(pane, &mountKey) as? BowserPaneView {
     view = existing
   } else {
+    let tmpT0 = CACurrentMediaTime()
     view = BowserPaneView(blockID: wanted.blockID)
+    rexTrace(String(format: "TMP init %.2f ms", (CACurrentMediaTime() - tmpT0) * 1000))
     objc_setAssociatedObject(pane, &mountKey, view, .OBJC_ASSOCIATION_RETAIN)
     rexTrace("block \(wanted.blockID): mounting (\(wanted.flavor ?? "?")), focus action \(paneFocusAction(pane) != nil ? "found" : "missing")")
   }
@@ -578,7 +685,9 @@ func reconcilePane(_ pane: NSView) {
   if paneIsFocused(pane, blockID: wanted.blockID), let window = view.window,
     !((window.firstResponder as? NSView)?.isDescendant(of: view) ?? false)
   {
+    let tmpF = CACurrentMediaTime()
     window.makeFirstResponder(view)
+    rexTrace(String(format: "TMP focus %.2f ms", (CACurrentMediaTime() - tmpF) * 1000))
     rexTrace("block \(wanted.blockID): took focus from Rex")
   }
 }
@@ -611,6 +720,7 @@ private var originalLayout: IMP?
 /// NSView.layout stays untouched for every other view.
 @_cdecl("rex_bowser_install")
 public func rexBowserInstall() {
+  _ = stallWatch
   guard let cls = NSClassFromString(paneClassName) else {
     return rexTrace("no \(paneClassName); Rex changed")
   }
@@ -636,6 +746,23 @@ func rexTrace(_ s: String) {
   guard let path = ProcessInfo.processInfo.environment["BOWSER_REX_TRACE"],
     let f = fopen(path, "a")
   else { return }
-  fputs(s + "\n", f)
+  var tv = timeval()
+  gettimeofday(&tv, nil)
+  fputs(String(format: "%ld.%06d ", tv.tv_sec, tv.tv_usec) + s + "\n", f)
   fclose(f)
 }
+
+// TMP: main-thread probe: logs each ping's delay over 2 ms.
+private let stallWatch: Void = {
+  guard ProcessInfo.processInfo.environment["BOWSER_REX_TRACE"] != nil else { return }
+  let q = DispatchQueue(label: "stalls", qos: .userInteractive)
+  func ping() {
+    let sent = CACurrentMediaTime()
+    DispatchQueue.main.async {
+      let late = (CACurrentMediaTime() - sent) * 1000
+      if late > 2 { rexTrace(String(format: "stall %.1f ms", late)) }
+      q.asyncAfter(deadline: .now() + 0.001) { ping() }
+    }
+  }
+  q.async { ping() }
+}()

@@ -638,6 +638,50 @@ static void test_windowed_keys_and_ime_reach_a_field(void) {
   [e.proc stop];
 }
 
+// Windowed opens start from a page the engine made ahead. Opens back to back
+// (the second finds the next one still being made) each show their own page,
+// as the first entry of their history.
+static void test_windowed_opens_back_to_back_are_fresh_pages(void) {
+  Engine *e = start_engine();
+  NSString *a = [e open:data_url(@"<title>one</title>") transport:kWindowed];
+  NSString *b = [e open:data_url(@"<title>two</title>") transport:kWindowed];
+  CHECK([e state:a where:^BOOL(NSDictionary *s) { return titled(s, @"one"); }], "the first open shows its page");
+  CHECK([e state:b where:^BOOL(NSDictionary *s) { return titled(s, @"two"); }], "the second shows its own");
+  for (NSString *sid in @[ a, b ]) {
+    NSDictionary *last = states_of(e, sid, 0).lastObject;
+    CHECK(![last[@"can_go_back"] boolValue], "with nothing to go back to: %s", last.description.UTF8String);
+  }
+  [e.proc stop];
+}
+
+// A key's press and its text are two messages, and a busy page can see them in
+// separate deliveries, as typing in a Rex pane does. Each key still types once.
+static void test_windowed_split_key_and_text_type_once(void) {
+  Engine *e = start_engine();
+  NSString *sid = [e open:data_url(@"<title>field</title><input autofocus><script>"
+                                   @"const f = document.querySelector('input');"
+                                   @"f.oninput = () => setTimeout(() => document.title = f.value);</script>")
+                transport:kWindowed];
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return titled(s, @"field"); }], "page loaded");
+  Host *h = attach_windowed(e, sid);
+  bowser_host_focus(h.handle, true);
+  const char *word = "crab";
+  const uint16_t codes[] = {8, 15, 0, 11}; // the US key codes for c, r, a, b
+  for (int i = 0; word[i]; i++) {
+    char one[2] = {word[i], 0};
+    bowser_key_s k = {.action = BOWSER_KEY_PRESS, .keycode = codes[i], .text = one, .unmodified_text = one};
+    bowser_host_key(h.handle, &k);
+    pump(0.05); // the press reaches the engine before its text, as a slow IME makes it
+    text(h, BOWSER_TEXT_INSERT, one);
+    k.action = BOWSER_KEY_RELEASE;
+    bowser_host_key(h.handle, &k);
+  }
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return [s[@"title"] isEqual:@"crab"]; }],
+        "typing crab types crab: %s", [[e.log valueForKey:@"title"] componentsJoinedByString:@"|"].UTF8String);
+  detach(h);
+  [e.proc stop];
+}
+
 static NSString *const kSelect = @"<title>pick</title><body style='margin:0'>"
                                  @"<select style='position:absolute;left:10px;top:10px;width:150px;height:30px' "
                                  @"onchange='document.title=this.value'>"
@@ -894,6 +938,8 @@ int main(void) {
         {"windowed: navigation reports url, title, and history", test_windowed_navigation_reports_state},
         {"windowed: a tab with no host is hidden", test_windowed_tab_without_a_host_is_hidden},
         {"windowed: key presses and IME text reach a field", test_windowed_keys_and_ime_reach_a_field},
+        {"windowed: a press and its text, delivered apart, type once", test_windowed_split_key_and_text_type_once},
+        {"windowed: opens back to back are fresh pages", test_windowed_opens_back_to_back_are_fresh_pages},
         {"windowed: a <select> is the host's menu", test_windowed_select_is_a_host_menu},
         {"windowed: a context menu is the host's menu", test_context_menu_windowed},
         {"osr: a context menu is the host's menu", test_context_menu_osr},

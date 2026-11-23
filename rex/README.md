@@ -1,9 +1,28 @@
 # dev.libbowser Rex block plugin
 
 Every `dev.libbowser.browser` block is one surface of a shared bowser-cef
-engine (`adapters/cef`). The plugin starts the engine with the first block,
-restarts it on the next call after it dies, and stops it when the last block
-closes. See `PROTOCOL.md` for the Rex wire protocol.
+engine (`adapters/cef`). The engine starts with the plugin, before any block
+needs it, starts again after it dies, and outlives the last block: a cold
+engine takes most of a second, and a block on a running one opens in
+milliseconds. See `PROTOCOL.md` for the Rex wire protocol.
+
+With `BOWSER_TICKET_SOCKET` set, the plugin also answers tickets on that Unix
+socket (`tickets.go`): a pane's session block ID in, `{"ticket"}` out, from a
+ticket minted ahead. The Rex client uses it in place of the `ticket` method,
+which it can reach only by starting the `rex` CLI.
+
+## Open a browser pane
+
+[`browser.lua`](browser.lua) adds a Rex action, `browser`. Load it from your
+`init.lua` with `dofile`; `rex-client/run.sh` does this for the dev server.
+
+| Where | How |
+|---|---|
+| Any pane | ⇧⌘B, then type an address or a search in Rex's prompt |
+| Rex's command list | **New Browser Pane** |
+| A shell | `rex do browser url=news.ycombinator.com` |
+
+The pane opens to the right of the focused pane, and takes focus.
 
 ```sh
 rex-client/run.sh server            # isolated dev server with this plugin; builds it and bowser-cef

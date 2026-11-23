@@ -196,3 +196,46 @@ BOWSER_SPACE=3 make test-cef                   # also checks real host windows o
 `bench-latency.sh` puts its probe window (alpha 0.01) on the current Space.
 The terminal needs the Screen Recording permission. The video page needs
 `ffmpeg` once, to write `build/bench/video.webm` (VP9: CEF has no H.264).
+
+## In Rex
+
+The same animated page (https://ghostty.org, a JavaScript ASCII animation) in
+a Rex pane of the dev harness, one tab per run, CALAYERHOST. CPU is the exact
+average over 10 s from each process's cumulative CPU time
+(`rex-client/dev/cpu.sh`), after 8 s to settle. Processes under 0.1 % are left
+out. The Rex window was on an inactive Space, so WindowServer's on-screen
+compositing is not in these numbers.
+
+| Process | Windowed (zero copy) | OSR (copy) |
+|---|---|---|
+| Browser (engine) | 0.4 % | 5.4 % |
+| GPU process | 6.7 % | 7.1 % |
+| Renderer | 20.8 % | 20.1 % |
+| Rex client | 0.0 % | 0.0 % |
+
+The renderer runs the page's own animation, the same in both modes. What the
+pipe adds is nearly free in windowed mode, and the Rex client does no work per
+frame in either.
+
+## Opening a pane in Rex
+
+`rex-client/bench-startup.sh 20` opens 20 browser panes in the dev harness, one
+at a time, with a local `data:` page, and reads the stages from the client
+trace and the engine log. Times in ms.
+
+| Stage | p50 | p90 | max | Who |
+|---|---|---|---|---|
+| Rex mounts the pane → page attached | 1.7 | 2.8 | 4.0 | libbowser and the Rex client hooks |
+| Engine opens → page drawn | 29 | 33 | 43 | Chromium |
+| Engine opens → Rex mounts the pane | 38 | 48 | 66 | Rex (server, sync, layout) |
+| `rex do browser` → engine opens | 52 | 62 | 72 | Rex (the CLI, init.lua, `session.new_split`) |
+
+The page draws before Rex mounts the pane, so the pane shows the page from its
+first frame. What made the first row small:
+
+| Before | After |
+|---|---|
+| The engine started with the first block (about 700 ms) and stopped with the last | It starts with the plugin and stays up |
+| Chromium started its GPU process for the first page (about 400 ms) | The engine draws a blank page at start, and keeps a page made ahead (the spare) |
+| The client started the `rex` CLI for each ticket (about 25 ms) | A ticket socket in the plugin, with a ticket minted ahead (under 1 ms) |
+| The attach waited for Rex's main thread, which lays the window out for 100 to 200 ms after a pane appears (a terminal pane too) | The pane attaches in the same main-thread turn that mounts it |
