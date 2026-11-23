@@ -1,29 +1,60 @@
 # libbowser
 
-A C ABI that lets one process show another process's live, native UI as a
-`CALayer`. See [SPEC.md](SPEC.md) for the design and [TODO.md](TODO.md) for status.
+A real Chromium browser as a native pane in Rex.
 
-## Build and run
+The engine runs in its own process. Rex mounts its output as a `CALayer` and
+sends input back. No frame copies, no video stream.
 
-```sh
-make                          # library, test producer, Swift host
-make test                     # end-to-end tests (real processes)
-make test-cef                 # the CEF engine (scripts/fetch-cef.sh first)
-make test-rex                 # the Rex plugin with the real engine
-scripts/demo.sh calayerhost   # or: iosurface
+```
+Rex server ── block plugin (Go) ── bowser-cef (Chromium)
+                                        │ ticket
+Rex client ── browser pane ─────────────┘ CALayerHost, keys, IME
 ```
 
-Set `BOWSER_SPACE=3` to open the host window on Mission Control Space 3
-without switching to it.
+Status: experiment, macOS only. The Rex side is a dev harness: Rex has no
+API for third-party panes yet, so it runs an injected copy of the Rex client.
+
+## Build
+
+```sh
+scripts/fetch-cef.sh   # pinned CEF build
+make && make cef
+make test              # core, real processes
+make test-cef          # the engine
+make test-rex          # the Rex plugin with the real engine
+```
+
+## Use in Rex
+
+```sh
+rex-client/run.sh server
+rex-client/run.sh client
+rex-client/dev/rexdev do browser url=news.ycombinator.com
+```
+
+⇧⌘B in a pane asks for an address. ⌘L, ⌘F, ⌘R, and zoom work in the page.
+
+## Numbers
+
+M4 MacBook Air, 60 Hz. Details in [docs/perf.md](docs/perf.md).
+
+| | |
+|---|---|
+| Frame time p99, animating | 16.7 ms |
+| Browser process CPU, animating | 0.4–3 % |
+| Rex mounts the pane → page attached | 1.7 ms p50, 2.8 ms p90 |
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `include/bowser.h` | The public C ABI |
-| `src/` | Control socket (`wire.c`), IOSurface frames over Mach (`frames.c`), producer and host |
-| `adapters/test/` | `bowser-test`: a producer with a scene for checking pacing, input, and IME |
-| `adapters/cef/` | `bowser-cef`: one CEF engine serving many surfaces; its control protocol and browser messages are in its README |
-| `rex/`, `rex-client/` | The Rex block plugin and the dev harness that runs it |
-| `examples/host-swift/` | `bowser-host`: a minimal AppKit host with `NSTextInputClient` |
-| `tests/e2e.m` | End-to-end tests against a real producer process |
+| `include/bowser.h` | The C ABI: producers, surfaces, hosts |
+| `src/` | Control socket, IOSurface frames over Mach, producer and host |
+| `adapters/cef/` | `bowser-cef`: one Chromium engine for many panes |
+| `adapters/test/` | A test producer |
+| `rex/` | The Rex block plugin, the `browser` action, the observed plugin protocol |
+| `rex-client/` | The pane view and the dev Rex client harness |
+| `examples/host-swift/` | A minimal AppKit host |
+| `tests/` | End-to-end tests |
+
+Design: [SPEC.md](SPEC.md). Status and known gaps: [TODO.md](TODO.md).
