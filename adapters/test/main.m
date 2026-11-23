@@ -372,6 +372,7 @@ static void on_resize(void *ud, bowser_surface_t *s, bowser_size_s size) {
   [scene layout];
 }
 static void on_focus(void *ud, bowser_surface_t *s, bool focused) { say(s, @"focus %d", focused); }
+static void on_display(void *ud, bowser_surface_t *s, uint32_t display) { say(s, @"display %u", display); }
 static void send_message(bowser_surface_t *s, const char *name, const char *body) {
   bowser_result_e rc = bowser_surface_send(s, name, body);
   if (rc != BOWSER_OK) say(s, @"send %s failed %d", name, rc);
@@ -435,6 +436,7 @@ int main(int argc, char **argv) {
         .focus_cb = on_focus,
         .attach_cb = on_attach,
         .message_cb = on_message,
+        .display_cb = on_display,
     };
     bowser_producer_t *producer;
     if (bowser_producer_new(&cfg, &producer) != BOWSER_OK) {

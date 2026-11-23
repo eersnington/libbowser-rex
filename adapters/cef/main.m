@@ -2,19 +2,27 @@
 // per surface. All of them share a profile, so logins persist, and share
 // CEF's GPU, network, and storage processes.
 //
-// CEF renders off screen with shared textures: its GPU process draws each
-// frame into an IOSurface from its own pool and lends it to us for the length
-// of on_accelerated_paint. We copy it into an IOSurface we own (Metal blit),
-// then show that copy with the surface's transport: as layer contents in our
-// CAContext on CALAYERHOST, or with bowser_surface_present on IOSURFACE.
+// A tab runs in one of two modes:
+//
+// - Windowed (windowed.m), the default on CALAYERHOST: zero copy. Chromium
+//   runs as in a window, one the user never sees, and the surface's layer
+//   tree hosts Chromium's own GPU-process layers.
+// - Off-screen rendering (OSR), on IOSURFACE, or with --mode osr: CEF's GPU
+//   process draws each frame into an IOSurface from its own pool and lends it
+//   to us for the length of on_accelerated_paint. We copy it into an
+//   IOSurface we own (Metal blit), then show that copy with the surface's
+//   transport: as layer contents in our CAContext on CALAYERHOST, or with
+//   bowser_surface_present on IOSURFACE.
 //
 // Usage:
-//   bowser-cef [--profile DIR]
+//   bowser-cef [--profile DIR] [--mode M]
 //       Control mode: JSON lines on stdin and stdout (see README.md). Exits
 //       when stdin closes.
-//   bowser-cef [--profile DIR] [--transport T] [--url URL] [--tickets N]
+//   bowser-cef [--profile DIR] [--mode M] [--transport T] [--url URL] [--tickets N]
 //       One tab: prints N tickets (default 1), one per line, then runs until
 //       SIGTERM or SIGINT. For tests, demos, and benchmarks.
+//   M: windowed (default) or osr. It sets CALAYERHOST tabs' mode; IOSURFACE
+//   tabs are always OSR.
 //
 // CEF paces frames with its own timer. Driving it from the display link
 // (external_begin_frame_enabled) measured no better: frame-interval jitter
@@ -27,9 +35,8 @@
 #include <fcntl.h>
 #include <stdatomic.h>
 
-#include "bowser.h"
+#include "engine.h"
 #include "include/capi/cef_app_capi.h"
-#include "include/capi/cef_browser_capi.h"
 #include "include/capi/cef_client_capi.h"
 #include "include/capi/cef_command_line_capi.h"
 #include "include/capi/cef_context_menu_handler_capi.h"
@@ -92,55 +99,6 @@ static NSString *ns_str(const cef_string_t *s) {
 - (void)dealloc { CFRelease(surface); }
 @end
 
-@interface Tab : NSObject {
-@public
-  NSString *sid;
-  bowser_transport_e transport;
-  bowser_surface_t *surface; // NULL once closed
-  bowser_size_s size;
-  bool attached;
-  NSString *startURL;
-  bool started; // CEF is making, or has made, the browser
-
-  cef_browser_t *browser;
-  cef_browser_host_t *host;
-
-  // Frames
-  NSMutableArray<Buffer *> *pool;
-  Buffer *last;     // the newest frame, re-shown to a host that attaches
-  CALayer *content; // CALAYERHOST: shows `last`
-  uint64_t frameNo;
-  bool repaintQueued;
-
-  // <select> and other popup widgets: a separate paint, composited over the view
-  NSMutableArray<Buffer *> *popupPool;
-  Buffer *popup; // newest popup paint, while shown
-  bool popupShown;
-  cef_rect_t popupRect; // view coordinates, inside the view
-  CALayer *popupLayer;  // CALAYERHOST: shows `popup`
-
-  // Input
-  bool composing;
-  cef_keyboard_input_event_t pendingKey; // the last key press, until its text arrives
-  uint32_t heldButtons;                  // CEF_EVENTFLAG_*_MOUSE_BUTTON
-  bowser_cursor_e cursor;
-
-  // Navigation state, sent to the host and the controller
-  NSString *url, *title;
-  bool loading, canGoBack, canGoForward;
-  double progress;
-  CFTimeInterval stateSentAt;
-  bool stateQueued;
-  NSString *findText;
-  int findCount, findActive;
-
-  // Stats, printed every 2 s while frames arrive
-  CFTimeInterval windowStart, lastPaint, resizeAt;
-  int frames, late;
-  double maxGapMs, jitter2, copyMs, copyMaxMs, gpuMs, resizeMaxMs;
-  NSMutableSet<NSNumber *> *sources;
-}
-@end
 @implementation Tab
 @end
 
@@ -148,6 +106,8 @@ static struct {
   bool control;      // JSON lines on stdin/stdout
   bool contextReady; // CEF can create browsers
   bool quitting;
+  bool osrOnly; // --mode osr: CALAYERHOST tabs render off screen too
+  int ticking;  // inside bowser_producer_tick
   bowser_producer_t *producers[2]; // by transport, made on first use
   NSMutableDictionary<NSString *, Tab *> *tabs;
   NSMutableDictionary<NSValue *, Tab *> *bySurface;
@@ -157,7 +117,15 @@ static struct {
   id<MTLCommandQueue> queue;
   dispatch_source_t input;
   NSMutableData *line;
+  NSMutableDictionary<NSNumber *, id> *menus; // open menus by id
+  int nextMenu;
 } E;
+
+bool engine_log_enabled(void) {
+  static int on = -1;
+  if (on < 0) on = getenv("BOWSER_LOG") != NULL;
+  return on;
+}
 
 static Tab *tab_for_surface(bowser_surface_t *s) { return E.bySurface[[NSValue valueWithPointer:s]]; }
 
@@ -507,6 +475,7 @@ static void on_resize(void *ud, bowser_surface_t *s, bowser_size_s size) {
   if (!t) return;
   bool rescaled = size.scale != t->size.scale;
   t->size = size;
+  if (t->windowed) return windowed_resize(t);
   if (!t->host) return;
   if (t->last) t->resizeAt = CACurrentMediaTime(); // the first frame is a page load, not a resize
   if (rescaled) t->host->notify_screen_info_changed(t->host);
@@ -559,6 +528,23 @@ static int CEF_CALLBACK on_cursor_change(cef_display_handler_t *self, cef_browse
     t->cursor = c;
     bowser_surface_set_cursor(t->surface, c);
   }
+  return 1;
+}
+
+// Chromium would show a tooltip window from this process. Suppress it until
+// the vocabulary can hand tooltips to the host.
+static int CEF_CALLBACK on_tooltip(cef_display_handler_t *self, cef_browser_t *browser, cef_string_t *text) {
+  unref(browser);
+  return 1;
+}
+
+// BOWSER_LOG=1 also prints the pages' consoles.
+static int CEF_CALLBACK on_console_message(cef_display_handler_t *self, cef_browser_t *browser,
+                                           cef_log_severity_t level, const cef_string_t *message,
+                                           const cef_string_t *source, int line) {
+  Tab *t = tab_of(browser);
+  unref(browser);
+  ENGINE_LOG("%s: console: %s\n", t ? t->sid.UTF8String : "?", ns_str(message).UTF8String);
   return 1;
 }
 
@@ -625,6 +611,102 @@ static void CEF_CALLBACK on_find_result(cef_find_handler_t *self, cef_browser_t 
   t->findCount = count;
   t->findActive = active;
   publish(t, @"find_result", @{@"count" : @(count), @"active" : @(active)});
+}
+
+// ---- Menus ----------------------------------------------------------
+//
+// The host shows every menu, as a real NSMenu in its own process: the
+// producer has no window of its own on screen to put one over. See `menu` and
+// `menu_result` in README.md.
+
+@interface Menu : NSObject {
+@public
+  Tab *tab;
+  void (^done)(int index);
+  CFTimeInterval deadline;
+}
+@end
+@implementation Menu
+@end
+
+static const double kMenuTimeout = 30; // s: then the producer stops waiting for the host
+
+NSDictionary *menu_item(NSString *label, bool enabled, bool checked, bool separator, NSArray *children) {
+  NSMutableDictionary *item = [@{
+    @"label" : label ?: @"",
+    @"enabled" : @(enabled),
+    @"checked" : @(checked),
+    @"separator" : @(separator),
+  } mutableCopy];
+  if (children) item[@"children"] = children;
+  return item;
+}
+
+static void finish_menu(int mid, int index) {
+  Menu *m = E.menus[@(mid)];
+  if (!m) return;
+  [E.menus removeObjectForKey:@(mid)];
+  m->done(index);
+}
+
+static bool menu_answer(Tab *t, int mid, int index) {
+  Menu *m = E.menus[@(mid)];
+  if (!m || m->tab != t) return false;
+  finish_menu(mid, index < 0 ? -1 : index);
+  return true;
+}
+
+static void dismiss_menus(Tab *t) {
+  for (NSNumber *mid in E.menus.allKeys)
+    if (((Menu *)E.menus[mid])->tab == t) finish_menu(mid.intValue, -1);
+}
+
+// Returns the menu's id, or 0 if it was dismissed at once.
+static int open_menu(Tab *t, NSString *kind, CGPoint at, int selected, NSArray *items, void (^done)(int index)) {
+  int mid = ++E.nextMenu;
+  NSDictionary *body = @{
+    @"id" : @(mid),
+    @"kind" : kind,
+    @"x" : @(at.x),
+    @"y" : @(at.y),
+    @"selected" : @(selected),
+    @"items" : items,
+  };
+  // Not kept for a later host: by then the page has moved on.
+  if (!t->surface || !t->attached || bowser_surface_send(t->surface, "menu", json_text(body).UTF8String) != BOWSER_OK) {
+    ENGINE_LOG("%s: menu %d dismissed: %s\n", t->sid.UTF8String, mid, t->attached ? bowser_last_error() : "no host");
+    done(-1);
+    return 0;
+  }
+  Menu *m = [Menu new];
+  m->tab = t;
+  m->done = done;
+  m->deadline = CACurrentMediaTime() + kMenuTimeout;
+  E.menus[@(mid)] = m;
+  return mid;
+}
+
+void menu_show(Tab *t, NSString *kind, CGPoint at, int selected, NSArray *items, void (^done)(int index)) {
+  int mid = open_menu(t, kind, at, selected, items, done);
+  if (mid)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kMenuTimeout * NSEC_PER_SEC)), dispatch_get_main_queue(),
+                   ^{ finish_menu(mid, -1); });
+}
+
+int menu_show_sync(Tab *t, NSString *kind, CGPoint at, int selected, NSArray *items) {
+  // The answer comes in a tick, and ticks don't nest.
+  if (E.ticking) {
+    ENGINE_LOG("%s: a menu opened inside a tick is dismissed\n", t->sid.UTF8String);
+    return -1;
+  }
+  __block int result = -2;
+  int mid = open_menu(t, kind, at, selected, items, ^(int index) { result = index; });
+  // As a real menu does: Chromium, our ticks, and the control channel run on.
+  while (result == -2) {
+    if (CACurrentMediaTime() > ((Menu *)E.menus[@(mid)])->deadline) finish_menu(mid, -1);
+    else CFRunLoopRunInMode((__bridge CFStringRef)NSEventTrackingRunLoopMode, 0.1, true);
+  }
+  return result;
 }
 
 // ---- Messages: the browser vocabulary (README.md) -------------------
@@ -727,6 +809,11 @@ static NSString *handle_message(Tab *t, NSString *name, NSDictionary *body) {
     int d = [delta intValue];
     // Chromium's own steps (90%, 110%, ...), remembered per site in the profile.
     t->host->zoom(t->host, d > 0 ? CEF_ZOOM_COMMAND_IN : d < 0 ? CEF_ZOOM_COMMAND_OUT : CEF_ZOOM_COMMAND_RESET);
+  } else if ([name isEqualToString:@"menu_result"]) {
+    id mid = body[@"id"], index = body[@"index"];
+    if (![mid isKindOfClass:NSNumber.class] || ![index isKindOfClass:NSNumber.class])
+      return @"menu_result needs an id and an index";
+    if (!menu_answer(t, [mid intValue], [index intValue])) return [NSString stringWithFormat:@"no open menu %@", mid];
   } else {
     return [NSString stringWithFormat:@"unknown message %@", name];
   }
@@ -761,6 +848,7 @@ static uint32_t cef_modifiers(uint64_t mods) {
 
 static void on_mouse(void *ud, bowser_surface_t *s, const bowser_mouse_s *m) {
   Tab *t = tab_for_surface(s);
+  if (t && t->windowed) return windowed_mouse(t, m);
   if (!t || !t->host) return;
   // bowser numbers buttons left, right, middle.
   static const cef_mouse_button_type_t buttons[] = {CEF_MOUSE_BUTTON_LEFT, CEF_MOUSE_BUTTON_RIGHT,
@@ -808,6 +896,7 @@ static void on_mouse(void *ud, bowser_surface_t *s, const bowser_mouse_s *m) {
 
 static void on_scroll(void *ud, bowser_surface_t *s, const bowser_scroll_s *sc) {
   Tab *t = tab_for_surface(s);
+  if (t && t->windowed) return windowed_scroll(t, sc);
   if (!t || !t->host) return;
   // AppKit's line deltas become pixels the way Chromium's own Mac event
   // builder does it: 40 px per line.
@@ -849,6 +938,7 @@ static void send_char(Tab *t, cef_keyboard_input_event_t e, char16_t c) {
 // own Mac view does.
 static void on_key(void *ud, bowser_surface_t *s, const bowser_key_s *k) {
   Tab *t = tab_for_surface(s);
+  if (t && t->windowed) return windowed_key(t, k);
   if (!t || !t->host) return;
   NSEvent *ns = [NSEvent keyEventWithType:k->action == BOWSER_KEY_RELEASE ? NSEventTypeKeyUp : NSEventTypeKeyDown
                                  location:NSZeroPoint
@@ -889,6 +979,7 @@ static void end_composition(Tab *t) {
 
 static void on_text(void *ud, bowser_surface_t *s, const bowser_text_s *in) {
   Tab *t = tab_for_surface(s);
+  if (t && t->windowed) return windowed_text(t, in);
   if (!t || !t->host) return;
   NSString *text = @(in->text ? in->text : "");
   cef_string_t str = cef_str(text.UTF8String);
@@ -933,14 +1024,33 @@ static void on_text(void *ud, bowser_surface_t *s, const bowser_text_s *in) {
 
 static void on_focus(void *ud, bowser_surface_t *s, bool focused) {
   Tab *t = tab_for_surface(s);
-  if (t && t->host) t->host->set_focus(t->host, focused);
+  if (!t) return;
+  t->focused = focused;
+  if (t->windowed) return windowed_focus(t, focused);
+  if (t->host) t->host->set_focus(t->host, focused);
 }
+
+static void on_display(void *ud, bowser_surface_t *s, uint32_t display) {
+  Tab *t = tab_for_surface(s);
+  // OSR paces with CEF's timer, not a display.
+  if (t && t->windowed) windowed_display(t, display);
+}
+
+static void dismiss_menus(Tab *t);
 
 static void on_attach(void *ud, bowser_surface_t *s, bool attached) {
   Tab *t = tab_for_surface(s);
   if (!t) return;
   t->attached = attached;
+  if (!attached) t->focused = false;
+  // A host that left can't answer; one that took over never saw the menu.
+  dismiss_menus(t);
   emit(@{@"event" : @"attached", @"surface" : t->sid, @"attached" : @(attached)});
+  if (t->windowed) {
+    windowed_attach(t, attached);
+    if (attached) bowser_surface_send(t->surface, "state", json_text(state_of(t)).UTF8String);
+    return;
+  }
   if (!attached) {
     // Keep only the frame a new host will be shown first.
     [t->pool filterUsingPredicate:[NSPredicate predicateWithFormat:@"self == %@", t->last]];
@@ -955,11 +1065,24 @@ static void on_attach(void *ud, bowser_surface_t *s, bool attached) {
   bowser_surface_send(t->surface, "state", json_text(state_of(t)).UTF8String);
 }
 
+static void tick(bowser_transport_e transport) {
+  if (!E.producers[transport]) return;
+  if (E.ticking) { // ticks don't nest: once this one is done
+    CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopDefaultMode, ^{ tick(transport); });
+    return;
+  }
+  E.ticking++;
+  bowser_producer_tick(E.producers[transport]);
+  E.ticking--;
+}
+
+// A run loop block, not the main queue: a synchronous menu waits for its
+// answer in a nested run loop, which runs no main-queue work when it was
+// entered from some.
 static void on_wakeup(void *ud) {
   bowser_transport_e transport = (bowser_transport_e)(intptr_t)ud;
-  dispatch_async(dispatch_get_main_queue(), ^{
-    if (E.producers[transport]) bowser_producer_tick(E.producers[transport]);
-  });
+  CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{ tick(transport); });
+  CFRunLoopWakeUp(CFRunLoopGetMain());
 }
 
 // ---- Tabs -----------------------------------------------------------
@@ -1006,6 +1129,16 @@ static void start_browser(Tab *t) {
       .windowless_rendering_enabled = 1,
       .shared_texture_enabled = 1,
   };
+  if (t->windowed) {
+    // A parent view, or CEF makes a window of its own, on screen.
+    NSView *parent = windowed_open(t);
+    wi = (cef_window_info_t){
+        .size = sizeof wi,
+        .bounds = {0, 0, (int)parent.bounds.size.width, (int)parent.bounds.size.height},
+        .parent_view = (__bridge void *)parent,
+        .runtime_style = CEF_RUNTIME_STYLE_ALLOY,
+    };
+  }
   cef_browser_settings_t bs = {
       .size = sizeof bs,
       .windowless_frame_rate = (int)NSScreen.mainScreen.maximumFramesPerSecond,
@@ -1031,15 +1164,17 @@ static bowser_producer_t *producer_for(bowser_transport_e transport) {
       .focus_cb = on_focus,
       .attach_cb = on_attach,
       .message_cb = on_message,
+      .display_cb = on_display,
   };
   if (bowser_producer_new(&cfg, &E.producers[transport]) != BOWSER_OK) return NULL;
   return E.producers[transport];
 }
 
-static Tab *open_tab(NSString *url, bowser_transport_e transport, NSString **error) {
+static Tab *open_tab(NSString *url, bowser_transport_e transport, bool windowed, NSString **error) {
   bowser_producer_t *p = producer_for(transport);
   Tab *t = [Tab new];
   t->transport = transport;
+  t->windowed = windowed;
   t->size = (bowser_size_s){800, 500, NSScreen.mainScreen.backingScaleFactor};
   if (!p || bowser_surface_new(p, t->size, &t->surface) != BOWSER_OK) {
     *error = @(bowser_last_error());
@@ -1052,7 +1187,7 @@ static Tab *open_tab(NSString *url, bowser_transport_e transport, NSString **err
   t->popupPool = [NSMutableArray new];
   t->sources = [NSMutableSet new];
   CALayer *root = bowser_surface_root_layer(t->surface);
-  if (root) {
+  if (root && !windowed) {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     t->content = [CALayer layer];
@@ -1065,6 +1200,7 @@ static Tab *open_tab(NSString *url, bowser_transport_e transport, NSString **err
     [root addSublayer:t->popupLayer];
     [CATransaction commit];
   }
+  if (windowed) windowed_open(t);
   E.tabs[t->sid] = t;
   E.bySurface[[NSValue valueWithPointer:t->surface]] = t;
   if (E.contextReady) start_browser(t);
@@ -1082,6 +1218,7 @@ static void close_tab(Tab *t) {
   t->last = t->popup = nil;
   [t->pool removeAllObjects];
   [t->popupPool removeAllObjects];
+  dismiss_menus(t);
   if (t->host) t->host->close_browser(t->host, 1);
   // A browser that CEF is still making closes in on_after_created.
   if (!t->started) {
@@ -1108,6 +1245,7 @@ static void CEF_CALLBACK on_after_created(cef_life_span_handler_t *self, cef_bro
     t->host->close_browser(t->host, 1);
     return;
   }
+  if (t->windowed) return windowed_created(t);
   t->host->was_resized(t->host); // the host may have resized us before now
   t->host->was_hidden(t->host, !t->attached);
 }
@@ -1120,6 +1258,7 @@ static void CEF_CALLBACK on_before_close(cef_life_span_handler_t *self, cef_brow
   unref(t->browser);
   t->host = NULL;
   t->browser = NULL;
+  if (t->windowed) windowed_closed(t);
   if (t->surface) { // CEF closed it on its own
     close_tab(t);
     emit(@{@"event" : @"closed", @"surface" : t->sid});
@@ -1130,9 +1269,10 @@ static void CEF_CALLBACK on_before_close(cef_life_span_handler_t *self, cef_brow
 
 // ---- Native UI the producer must never show -------------------------
 //
-// The producer has no window, so CEF would put menus, alerts, and file panels
-// on whatever screen the user is looking at. Suppress them until the ABI can
-// hand them to the host.
+// The producer has no window on screen, so CEF would put menus, alerts, and
+// file panels on whatever screen the user is looking at. Menus go to the host
+// (see Menus); the rest is suppressed until the vocabulary can hand it over.
+// windowed.m also keeps every window and menu of this process off screen.
 
 // Links that target a new window (target=_blank, window.open) open in this
 // tab instead: the host owns tabs, and there is no message for "new tab" yet.
@@ -1150,14 +1290,137 @@ static int CEF_CALLBACK on_before_popup(cef_life_span_handler_t *self, cef_brows
   return 1;
 }
 
+// Context menus: CEF's model, trimmed to what works without a window of our
+// own, plus the link items a browser has.
+enum { kOpenLink = MENU_ID_USER_FIRST, kCopyLink };
+
+static bool kept_command(int command) {
+  return (command >= MENU_ID_BACK && command <= MENU_ID_STOPLOAD) ||
+         (command >= MENU_ID_UNDO && command <= MENU_ID_SELECT_ALL) ||
+         (command >= MENU_ID_SPELLCHECK_SUGGESTION_0 && command <= MENU_ID_ADD_TO_DICTIONARY) ||
+         command == kOpenLink || command == kCopyLink;
+}
+
 static void CEF_CALLBACK on_before_context_menu(cef_context_menu_handler_t *self, cef_browser_t *browser,
                                                 cef_frame_t *frame, cef_context_menu_params_t *params,
                                                 cef_menu_model_t *model) {
-  model->clear(model); // an empty menu isn't shown
+  // Print and View Source would open windows; Find has the find message.
+  for (size_t i = model->get_count(model); i-- > 0;) {
+    cef_menu_item_type_t type = model->get_type_at(model, i);
+    if (type != MENUITEMTYPE_SEPARATOR && !kept_command(model->get_command_id_at(model, i))) model->remove_at(model, i);
+  }
+  int forward = model->get_index_of(model, MENU_ID_FORWARD);
+  if (forward >= 0 && model->get_index_of(model, MENU_ID_RELOAD) < 0) {
+    cef_string_t reload = cef_str("Reload");
+    model->insert_item_at(model, (size_t)forward + 1, MENU_ID_RELOAD, &reload);
+    cef_string_clear(&reload);
+  }
+  cef_string_userfree_t link = params->get_link_url(params);
+  if (link && link->length) {
+    cef_string_t open = cef_str("Open Link"), copy = cef_str("Copy Link Address");
+    model->insert_separator_at(model, 0);
+    model->insert_item_at(model, 0, kCopyLink, &copy);
+    model->insert_item_at(model, 0, kOpenLink, &open);
+    cef_string_clear(&open);
+    cef_string_clear(&copy);
+  }
+  if (link) cef_string_userfree_free(link);
+  // No separator first, last, or after another.
+  for (size_t i = model->get_count(model); i-- > 0;) {
+    if (model->get_type_at(model, i) != MENUITEMTYPE_SEPARATOR) continue;
+    size_t n = model->get_count(model);
+    if (i == 0 || i == n - 1 || model->get_type_at(model, i - 1) == MENUITEMTYPE_SEPARATOR) model->remove_at(model, i);
+  }
   unref(model);
   unref(params);
   unref(frame);
   unref(browser);
+}
+
+static NSString *without_mnemonic(NSString *label) {
+  NSMutableString *out = [NSMutableString new];
+  for (NSUInteger i = 0; i < label.length; i++) {
+    unichar c = [label characterAtIndex:i];
+    if (c == '&' && i + 1 < label.length) c = [label characterAtIndex:++i]; // "&&" is "&"
+    [out appendFormat:@"%C", c];
+  }
+  return out;
+}
+
+// The model's items for `menu`. commands gets the command of each flattened
+// index, depth first, or 0 where there is none to run.
+static NSArray *menu_items(cef_menu_model_t *m, NSMutableArray<NSNumber *> *commands) {
+  NSMutableArray *items = [NSMutableArray new];
+  for (size_t i = 0, n = m->get_count(m); i < n; i++) {
+    if (!m->is_visible_at(m, i)) continue;
+    cef_menu_item_type_t type = m->get_type_at(m, i);
+    if (type == MENUITEMTYPE_SEPARATOR) {
+      [commands addObject:@0];
+      [items addObject:menu_item(@"", false, false, true, nil)];
+      continue;
+    }
+    cef_string_userfree_t l = m->get_label_at(m, i);
+    NSString *label = without_mnemonic(ns_str(l));
+    if (l) cef_string_userfree_free(l);
+    bool enabled = m->is_enabled_at(m, i);
+    [commands addObject:@(enabled && type != MENUITEMTYPE_SUBMENU ? m->get_command_id_at(m, i) : 0)];
+    NSArray *children = nil;
+    if (type == MENUITEMTYPE_SUBMENU) {
+      cef_menu_model_t *sub = m->get_sub_menu_at(m, i);
+      children = sub ? menu_items(sub, commands) : @[];
+      unref(sub);
+    }
+    [items addObject:menu_item(label, enabled, m->is_checked_at(m, i), false, children)];
+  }
+  return items;
+}
+
+static int CEF_CALLBACK run_context_menu(cef_context_menu_handler_t *self, cef_browser_t *browser, cef_frame_t *frame,
+                                         cef_context_menu_params_t *params, cef_menu_model_t *model,
+                                         cef_run_context_menu_callback_t *callback) {
+  Tab *t = tab_of(browser);
+  NSMutableArray<NSNumber *> *commands = [NSMutableArray new];
+  NSArray *items = menu_items(model, commands);
+  CGPoint at = {params->get_xcoord(params), params->get_ycoord(params)};
+  unref(model);
+  unref(params);
+  unref(frame);
+  unref(browser);
+  if (!t || items.count == 0) {
+    callback->cancel(callback);
+    unref(callback);
+    return 1;
+  }
+  menu_show(t, @"context", at, -1, items, ^(int index) {
+    int command = index < (int)commands.count && index >= 0 ? commands[index].intValue : 0;
+    if (command) callback->cont(callback, command, EVENTFLAG_NONE);
+    else callback->cancel(callback);
+    unref(callback);
+  });
+  return 1; // never CEF's own NSMenu
+}
+
+static int CEF_CALLBACK on_context_menu_command(cef_context_menu_handler_t *self, cef_browser_t *browser,
+                                                cef_frame_t *frame, cef_context_menu_params_t *params, int command,
+                                                cef_event_flags_t flags) {
+  Tab *t = tab_of(browser);
+  int handled = 0;
+  if (command == kOpenLink || command == kCopyLink) {
+    cef_string_userfree_t link = params->get_link_url(params);
+    NSString *url = ns_str(link);
+    if (link) cef_string_userfree_free(link);
+    // In this tab, like target=_blank (see on_before_popup).
+    if (command == kOpenLink && t && t->browser) load(t, url);
+    if (command == kCopyLink) {
+      [NSPasteboard.generalPasteboard clearContents];
+      [NSPasteboard.generalPasteboard setString:url forType:NSPasteboardTypeString];
+    }
+    handled = 1;
+  }
+  unref(params);
+  unref(frame);
+  unref(browser);
+  return handled;
 }
 
 static int CEF_CALLBACK on_jsdialog(cef_jsdialog_handler_t *self, cef_browser_t *browser, const cef_string_t *origin,
@@ -1205,6 +1468,8 @@ static cef_display_handler_t display_handler = {
     .on_title_change = on_title_change,
     .on_loading_progress_change = on_loading_progress_change,
     .on_cursor_change = on_cursor_change,
+    .on_tooltip = on_tooltip,
+    .on_console_message = on_console_message,
 };
 static cef_load_handler_t load_handler = {
     STATIC_BASE(cef_load_handler_t),
@@ -1224,6 +1489,8 @@ static cef_life_span_handler_t life_span_handler = {
 static cef_context_menu_handler_t context_menu_handler = {
     STATIC_BASE(cef_context_menu_handler_t),
     .on_before_context_menu = on_before_context_menu,
+    .run_context_menu = run_context_menu,
+    .on_context_menu_command = on_context_menu_command,
 };
 static cef_jsdialog_handler_t jsdialog_handler = {
     STATIC_BASE(cef_jsdialog_handler_t),
@@ -1253,7 +1520,8 @@ static cef_client_t *new_client(Tab *t) {
   c->client = (cef_client_t){
       .base = {.size = sizeof(cef_client_t), .add_ref = client_add_ref, .release = client_release,
                .has_one_ref = client_has_one_ref, .has_at_least_one_ref = client_has_ref},
-      .get_render_handler = get_render_handler,
+      // Windowed browsers draw in their window; only OSR has a render handler.
+      .get_render_handler = t->windowed ? NULL : get_render_handler,
       .get_display_handler = get_display_handler,
       .get_load_handler = get_load_handler,
       .get_find_handler = get_find_handler,
@@ -1276,17 +1544,32 @@ static bool parse_transport(id value, bowser_transport_e *out) {
   return true;
 }
 
+static bool parse_mode(id value, bool *windowed) {
+  if ([value isEqual:@"windowed"]) *windowed = true;
+  else if ([value isEqual:@"osr"]) *windowed = false;
+  else return false;
+  return true;
+}
+
+static bool default_windowed(bowser_transport_e transport) {
+  return transport == BOWSER_TRANSPORT_CALAYERHOST && !E.osrOnly;
+}
+
 static NSDictionary *run_command(NSDictionary *cmd) {
   NSString *name = cmd[@"cmd"];
   if (![name isKindOfClass:NSString.class]) return @{@"error" : @"no cmd"};
   if ([name isEqualToString:@"open"]) {
     bowser_transport_e transport;
     if (!parse_transport(cmd[@"transport"], &transport)) return @{@"error" : @"transport: calayerhost or iosurface"};
+    bool windowed = default_windowed(transport);
+    id mode = cmd[@"mode"];
+    if (mode && !parse_mode(mode, &windowed)) return @{@"error" : @"mode: windowed or osr"};
+    if (windowed && transport != BOWSER_TRANSPORT_CALAYERHOST) return @{@"error" : @"windowed mode needs calayerhost"};
     id typed = cmd[@"url"];
     NSString *url = [typed isKindOfClass:NSString.class] ? fixup_url(typed) : nil;
     NSString *error;
-    Tab *t = open_tab(url ?: @"about:blank", transport, &error);
-    return t ? @{@"surface" : t->sid} : @{@"error" : error};
+    Tab *t = open_tab(url ?: @"about:blank", transport, windowed, &error);
+    return t ? @{@"surface" : t->sid, @"mode" : windowed ? @"windowed" : @"osr"} : @{@"error" : error};
   }
   id sid = cmd[@"surface"];
   Tab *t = [sid isKindOfClass:NSString.class] ? E.tabs[sid] : nil;
@@ -1424,6 +1707,14 @@ int main(int argc, char **argv) {
         tickets = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--profile") && i + 1 < argc)
         profile = @(argv[++i]);
+      else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
+        bool windowed;
+        if (!parse_mode(@(argv[++i]), &windowed)) {
+          fprintf(stderr, "bowser-cef: --mode windowed or osr\n");
+          return 2;
+        }
+        E.osrOnly = !windowed;
+      }
     }
     E.control = !url && tickets < 0;
     if (!profile) {
@@ -1439,6 +1730,7 @@ int main(int argc, char **argv) {
 
     [BowserApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
+    windowed_init();
 
     const char *hash = cef_api_hash(CEF_API_VERSION, 0);
     if (strcmp(hash, CEF_API_HASH_PLATFORM) != 0) {
@@ -1473,10 +1765,11 @@ int main(int argc, char **argv) {
     E.tabs = [NSMutableDictionary new];
     E.bySurface = [NSMutableDictionary new];
     E.pending = [NSMutableArray new];
+    E.menus = [NSMutableDictionary new];
 
     if (!E.control) {
       NSString *error;
-      Tab *t = open_tab(url ?: @"https://example.com", transport, &error);
+      Tab *t = open_tab(url ?: @"https://example.com", transport, default_windowed(transport), &error);
       if (!t) {
         fprintf(stderr, "bowser-cef: %s\n", error.UTF8String);
         return 1;

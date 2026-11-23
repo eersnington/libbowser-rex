@@ -13,6 +13,7 @@ static void test_input_reaches_producer_intact(void) {
   CHECK([p expect:@"s0 attached"], "producer never saw the host");
 
   bowser_host_resize(h.handle, (bowser_size_s){640, 400, 2});
+  bowser_host_set_display(h.handle, 7);
   bowser_host_focus(h.handle, true);
   bowser_key_s k = {.action = BOWSER_KEY_PRESS, .keycode = 0, .text = "a", .timestamp_ns = 42};
   bowser_host_key(h.handle, &k);
@@ -24,7 +25,7 @@ static void test_input_reaches_producer_intact(void) {
   bowser_host_scroll(h.handle, &sc);
 
   NSArray *want = @[
-    @"s0 resize 640x400@2", @"s0 focus 1", @"s0 key 0 0 a 42", @"s0 text 1 にほ", @"s0 text 0 日本",
+    @"s0 resize 640x400@2", @"s0 display 7", @"s0 focus 1", @"s0 key 0 0 a 42", @"s0 text 1 にほ", @"s0 text 0 日本",
     @"s0 mouse 0 0 12.5 34.0 2", @"s0 scroll 0.0 -10.0 1"
   ];
   NSMutableArray *got = [NSMutableArray new];
@@ -41,7 +42,7 @@ static void test_ticket_works_once(void) {
   Host *a, *b;
   CHECK(attach(p.tickets[0], &a) == BOWSER_OK, "first use: %s", bowser_last_error());
   CHECK(attach(p.tickets[0], &b) == BOWSER_ERR_TICKET, "second use must fail with a ticket error");
-  CHECK(attach(@"bowser2:/nonexistent.sock#00", &b) == BOWSER_ERR_TICKET, "a dead producer is a ticket error");
+  CHECK(attach(@"bowser3:/nonexistent.sock#00", &b) == BOWSER_ERR_TICKET, "a dead producer is a ticket error");
   detach(a);
   [p kill];
 }
@@ -564,7 +565,7 @@ static void test_host_keeps_its_frames_in_use(void) {
 
 // Do the handshake by hand to learn the producer's Mach frame service name.
 static NSString *frame_service(NSString *ticket) {
-  NSString *rest = [ticket substringFromIndex:strlen("bowser2:")];
+  NSString *rest = [ticket substringFromIndex:strlen("bowser3:")];
   NSRange hash = [rest rangeOfString:@"#" options:NSBackwardsSearch];
   NSString *path = [rest substringToIndex:hash.location], *token = [rest substringFromIndex:hash.location + 1];
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);

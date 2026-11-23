@@ -165,7 +165,7 @@ Types seen: `session_attached`, `focus` (`{"action":"in"}`), `session_view_chang
 
 ```json
 ← {"block_id":"<hosted>","method":"ticket","args":{}}
-→ {"ticket":"bowser2:…"}
+→ {"ticket":"bowser3:…"}
 ```
 
 `args` is `{}` when the caller gives none. **Rex does not check `args` against `input_schema`** (`{"x":1}` reached the plugin). **Verified.** It is not known whether Rex checks the output against `output_schema`.

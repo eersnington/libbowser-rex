@@ -82,6 +82,7 @@ void bw_put_frame(bw_buf *out, uint16_t type, const bw_buf *payload) {
 uint32_t bw_latest_wins_kind(uint16_t type, const bw_buf *payload) {
   switch (type) {
   case BW_MSG_RESIZE:
+  case BW_MSG_DISPLAY:
   case BW_MSG_CARET:
   case BW_MSG_COMPOSITION:
   case BW_MSG_CURSOR:

@@ -31,7 +31,9 @@ var creatorList = map[string]any{
 					"description":  "The page's newest state, and the block's engine.",
 					"input_schema": obj(map[string]any{}),
 					"output_schema": obj(stateProps(map[string]any{
-						"transport":  map[string]any{"type": "string", "enum": []string{"calayerhost", "iosurface"}},
+						"transport": map[string]any{"type": "string", "enum": []string{"calayerhost", "iosurface"}},
+						"mode": map[string]any{"type": "string", "enum": []string{"windowed", "osr"},
+							"description": "windowed: zero copy, the default on calayerhost. osr: a copy per frame."},
 						"engine_pid": map[string]any{"type": "integer", "minimum": 0, "description": "0 while the block has no surface."},
 					})),
 				},

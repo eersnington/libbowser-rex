@@ -220,8 +220,16 @@ static void test_cursor_follows_the_page(void) {
 }
 
 - (NSString *)open:(NSString *)url {
-  NSDictionary *r = [self call:@{@"cmd" : @"open", @"url" : url, @"transport" : @"iosurface"}];
+  return [self open:url transport:@"iosurface"];
+}
+
+// calayerhost opens a windowed (zero-copy) tab, iosurface an OSR one.
+- (NSString *)open:(NSString *)url transport:(NSString *)transport {
+  NSDictionary *r = [self call:@{@"cmd" : @"open", @"url" : url, @"transport" : transport}];
   CHECK(r[@"surface"], "open: %s", r.description.UTF8String);
+  NSString *want = [transport isEqual:@"calayerhost"] ? @"windowed" : @"osr";
+  CHECK([r[@"mode"] isEqual:want], "a %s tab is %s: %s", transport.UTF8String, want.UTF8String,
+        r.description.UTF8String);
   return r[@"surface"];
 }
 
@@ -485,6 +493,384 @@ static void test_select_popup_shows(void) {
   [p stop];
 }
 
+
+// ---- Windowed (zero-copy) tabs --------------------------------------------
+//
+// A windowed tab's pixels are Chromium's own GPU layers, which a host in this
+// process can't read back; what the page does shows in its title instead.
+
+static NSString *const kWindowed = @"calayerhost";
+
+// Whether a window of the engine is on screen. Never, in any mode.
+static BOOL engine_window_on_screen(Engine *e) {
+  NSArray *windows = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID));
+  for (NSDictionary *w in windows)
+    if ([w[(id)kCGWindowOwnerPID] intValue] == e.proc.pid) return YES;
+  return NO;
+}
+
+static void click_button(Host *h, double x, double y, int button) {
+  bowser_mouse_s m = {.action = BOWSER_MOUSE_MOVE, .x = x, .y = y};
+  bowser_host_mouse(h.handle, &m);
+  m.action = BOWSER_MOUSE_DOWN;
+  m.button = button;
+  m.click_count = 1;
+  bowser_host_mouse(h.handle, &m);
+  m.action = BOWSER_MOUSE_UP;
+  bowser_host_mouse(h.handle, &m);
+}
+
+// The newest `menu` message the host got after `since` messages.
+static NSDictionary *menu_after(Host *h, NSUInteger since) {
+  for (NSUInteger i = h.messages.count; i-- > since;)
+    if ([h.messages[i] hasPrefix:@"menu "]) return parse([h.messages[i] substringFromIndex:5]);
+  return nil;
+}
+
+static NSDictionary *wait_menu(Host *h, NSUInteger since) {
+  __block NSDictionary *menu;
+  wait_for(^{ return (BOOL)((menu = menu_after(h, since)) != nil); }, 5);
+  return menu;
+}
+
+static void answer(Host *h, NSDictionary *menu, int index) {
+  bowser_host_send(h.handle, "menu_result",
+                   [NSString stringWithFormat:@"{\"id\":%@,\"index\":%d}", menu[@"id"], index].UTF8String);
+}
+
+// Depth first, separators and submenu items included: the index menu_result takes.
+static void flatten(NSArray *items, NSMutableArray *out) {
+  for (NSDictionary *item in items) {
+    [out addObject:item];
+    if (item[@"children"]) flatten(item[@"children"], out);
+  }
+}
+
+static int index_of(NSDictionary *menu, NSString *label) {
+  NSMutableArray *flat = [NSMutableArray new];
+  flatten(menu[@"items"], flat);
+  for (NSUInteger i = 0; i < flat.count; i++)
+    if ([flat[i][@"label"] isEqual:label]) return (int)i;
+  return -1;
+}
+
+// At the display's scale, as a real host: a scale change in flight makes
+// CEF's OSR place a context menu by the old scale.
+static Host *attach_windowed(Engine *e, NSString *sid) {
+  Host *h;
+  CHECK(attach([e ticket:sid], &h) == BOWSER_OK, "attach: %s", bowser_last_error());
+  bowser_host_layer(h.handle).frame = CGRectMake(0, 0, 300, 200);
+  bowser_host_resize(h.handle, (bowser_size_s){300, 200, NSScreen.mainScreen.backingScaleFactor});
+  if (!h.messages) h.messages = [NSMutableArray new];
+  return h;
+}
+
+static void test_windowed_navigation_reports_state(void) {
+  Engine *e = start_engine();
+  NSString *a = data_url([kPageA stringByAppendingString:@"lorem ipsum lorem"]), *b = data_url(kPageB);
+  NSString *sid = [e open:a transport:kWindowed];
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return titled(s, @"A") && [s[@"url"] isEqual:a]; }],
+        "the controller hears the first page's title and url");
+  Host *h = attach_windowed(e, sid);
+  CHECK(wait_for(^{ return [host_state(h)[@"title"] isEqual:@"A"]; }, 3), "a host that attaches gets the state");
+  bowser_host_send(h.handle, "navigate", [NSString stringWithFormat:@"{\"url\":\"%@\"}", b].UTF8String);
+  NSDictionary *s = [e state:sid where:^BOOL(NSDictionary *s) { return titled(s, @"B"); }];
+  CHECK([s[@"url"] isEqual:b] && [s[@"can_go_back"] boolValue], "a host's navigate loads the page: %s",
+        s.description.UTF8String);
+  CHECK(wait_for(^{ return titled(host_state(h), @"B"); }, 3), "and the host hears it too");
+  [e message:@"back" to:sid body:nil];
+  s = [e state:sid where:^BOOL(NSDictionary *s) { return titled(s, @"A"); }];
+  CHECK([s[@"can_go_forward"] boolValue], "back returns to the first page: %s", s.description.UTF8String);
+  [e message:@"find" to:sid body:@{@"text" : @"lorem"}];
+  NSDictionary *r = [e wait:^BOOL(NSDictionary *ev) { return [ev[@"event"] isEqual:@"find_result"]; } within:5];
+  CHECK([r[@"count"] intValue] == 2, "find works in a windowed tab: %s", r.description.UTF8String);
+  CHECK(!engine_window_on_screen(e), "and no window of the engine is on screen");
+  detach(h);
+  [e.proc stop];
+}
+
+// A tab no host shows is hidden, like a background tab: Chromium stops
+// drawing and throttles it.
+static void test_windowed_tab_without_a_host_is_hidden(void) {
+  Engine *e = start_engine();
+  NSString *sid = [e open:data_url(@"<title>t</title><script>"
+                                   @"document.onvisibilitychange = () => document.title = document.visibilityState;"
+                                   @"</script>")
+                transport:kWindowed];
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return titled(s, @"t"); }], "page loaded");
+  Host *h = attach_windowed(e, sid);
+  pump(0.5);
+  detach(h);
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return [s[@"title"] isEqual:@"hidden"]; }],
+        "when its host leaves, the tab is hidden");
+  Host *again = attach_windowed(e, sid);
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return [s[@"title"] isEqual:@"visible"]; }],
+        "and visible again for the next host");
+  detach(again);
+  [e.proc stop];
+}
+
+static void test_windowed_keys_and_ime_reach_a_field(void) {
+  Engine *e = start_engine();
+  // The title is the field's value, with * while a composition is open.
+  NSString *sid = [e open:data_url(@"<title>field</title><input autofocus><script>"
+                                   @"const f = document.querySelector('input'); let c = '';"
+                                   @"const show = () => setTimeout(() => document.title = f.value + c);"
+                                   @"f.oninput = show;"
+                                   @"f.addEventListener('compositionstart', () => { c = '*'; show(); });"
+                                   @"f.addEventListener('compositionend', () => { c = ''; show(); });</script>")
+                transport:kWindowed];
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return titled(s, @"field"); }], "page loaded");
+  Host *h = attach_windowed(e, sid);
+  bowser_host_focus(h.handle, true);
+  type_into(h, "o");
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return [s[@"title"] isEqual:@"o"]; }], "a key press types");
+  text(h, BOWSER_TEXT_SET_MARKED, "かな");
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return [s[@"title"] isEqual:@"oかな*"]; }],
+        "marked text is a composition: %s", [[e.log valueForKey:@"title"] componentsJoinedByString:@"|"].UTF8String);
+  CHECK(wait_for(^{ return (BOOL)(h.composing && h.compositionRects.count > 0); }, 3),
+        "the host hears where the composition is");
+  text(h, BOWSER_TEXT_INSERT, "仮名");
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return [s[@"title"] isEqual:@"o仮名"]; }],
+        "the commit replaces the composition and ends it: %s", e.log.lastObject.description.UTF8String);
+  CHECK(wait_for(^{ return (BOOL)!h.composing; }, 3), "and the host hears the composition ended");
+  detach(h);
+  [e.proc stop];
+}
+
+static NSString *const kSelect = @"<title>pick</title><body style='margin:0'>"
+                                 @"<select style='position:absolute;left:10px;top:10px;width:150px;height:30px' "
+                                 @"onchange='document.title=this.value'>"
+                                 @"<option>a</option><option>b</option><option disabled>x</option><option>c</option>"
+                                 @"</select>";
+
+// A <select>'s list is the host's native menu; the producer's never shows.
+static void test_windowed_select_is_a_host_menu(void) {
+  Engine *e = start_engine();
+  NSString *sid = [e open:data_url(kSelect) transport:kWindowed];
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return titled(s, @"pick"); }], "page loaded");
+  Host *h = attach_windowed(e, sid);
+  bowser_host_focus(h.handle, true);
+  NSUInteger mark = h.messages.count;
+  click_button(h, 60, 25, 0);
+  NSDictionary *menu = wait_menu(h, mark);
+  CHECK([menu[@"kind"] isEqual:@"select"], "clicking the select asks the host for a menu: %s",
+        menu.description.UTF8String);
+  NSArray *labels = [menu[@"items"] valueForKey:@"label"];
+  CHECK([labels isEqual:(@[ @"a", @"b", @"x", @"c" ])], "with the options: %s", labels.description.UTF8String);
+  CHECK([menu[@"selected"] intValue] == 0, "the current one selected");
+  CHECK(![menu[@"items"][2][@"enabled"] boolValue] && [menu[@"items"][3][@"enabled"] boolValue],
+        "and disabled options disabled");
+  CHECK(fabs([menu[@"x"] doubleValue] - 10) < 2 && fabs([menu[@"y"] doubleValue] - 10) < 2,
+        "at the select's top-left corner: %.1f, %.1f", [menu[@"x"] doubleValue], [menu[@"y"] doubleValue]);
+  CHECK(!engine_window_on_screen(e), "and while it is open, no window of the engine is on screen");
+  answer(h, menu, 3);
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return [s[@"title"] isEqual:@"c"]; }],
+        "the host's choice changes the select: %s", e.log.lastObject.description.UTF8String);
+
+  mark = h.messages.count;
+  click_button(h, 60, 25, 0);
+  menu = wait_menu(h, mark);
+  CHECK([menu[@"selected"] intValue] == 3, "the next menu has the new value selected: %s",
+        menu.description.UTF8String);
+  NSUInteger states = states_of(e, sid, 0).count;
+  answer(h, menu, -1);
+  pump(0.5);
+  [e read:0.1];
+  CHECK(states_of(e, sid, 0).count == states, "dismissing it changes nothing");
+
+  // A host that leaves with a menu open must not leave the page stuck in it.
+  mark = h.messages.count;
+  click_button(h, 60, 25, 0);
+  CHECK(wait_menu(h, mark), "a third menu");
+  detach(h);
+  Host *next = attach_windowed(e, sid);
+  bowser_host_focus(next.handle, true);
+  click_button(next, 60, 25, 0);
+  menu = wait_menu(next, 0);
+  CHECK(menu, "after its host left, the page opens menus for the next host");
+  answer(next, menu, 1);
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return [s[@"title"] isEqual:@"b"]; }], "and takes the answer");
+  detach(next);
+  [e.proc stop];
+}
+
+// Right click, in both modes: the host shows the page's context menu.
+static void context_menu_goes_back(NSString *transport) {
+  Engine *e = start_engine();
+  NSString *sid = [e open:data_url(kPageA) transport:transport];
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return titled(s, @"A"); }], "A loaded");
+  [e message:@"navigate" to:sid body:@{@"url" : data_url(kPageB)}];
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return titled(s, @"B"); }], "B loaded");
+  Host *h = attach_windowed(e, sid);
+  bowser_host_focus(h.handle, true);
+  NSUInteger mark = h.messages.count;
+  click_button(h, 100, 80, 1);
+  NSDictionary *menu = wait_menu(h, mark);
+  CHECK([menu[@"kind"] isEqual:@"context"] && [menu[@"selected"] intValue] == -1,
+        "a right click asks the host for a context menu: %s", menu.description.UTF8String);
+  CHECK(fabs([menu[@"x"] doubleValue] - 100) < 2 && fabs([menu[@"y"] doubleValue] - 80) < 2,
+        "at the click: %.1f, %.1f", [menu[@"x"] doubleValue], [menu[@"y"] doubleValue]);
+  int back = index_of(menu, @"Back");
+  CHECK(back >= 0 && index_of(menu, @"Reload") >= 0 && index_of(menu, @"Print") < 0,
+        "with Back and Reload, and nothing that opens a window: %s", menu.description.UTF8String);
+  answer(h, menu, back);
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return titled(s, @"A"); }], "choosing Back goes back");
+  CHECK(!engine_window_on_screen(e), "no window of the engine came on screen");
+  detach(h);
+  [e.proc stop];
+}
+
+static void test_context_menu_windowed(void) { context_menu_goes_back(kWindowed); }
+static void test_context_menu_osr(void) { context_menu_goes_back(@"iosurface"); }
+
+static void test_windowed_surfaces_are_isolated(void) {
+  Engine *e = start_engine();
+  NSString *a = [e open:data_url([NSString stringWithFormat:kField, @"a"]) transport:kWindowed];
+  NSString *b = [e open:data_url(kSelect) transport:kWindowed];
+  CHECK([e state:a where:^BOOL(NSDictionary *s) { return titled(s, @"a"); }], "a loaded");
+  CHECK([e state:b where:^BOOL(NSDictionary *s) { return titled(s, @"pick"); }], "b loaded");
+  Host *ha = attach_windowed(e, a), *hb = attach_windowed(e, b);
+  bowser_host_focus(ha.handle, true);
+  bowser_host_focus(hb.handle, true);
+
+  NSUInteger mark = e.log.count;
+  type_into(ha, "x");
+  CHECK([e state:a where:^BOOL(NSDictionary *s) { return [s[@"title"] isEqual:@"x"]; }], "typing reaches a's field");
+  click_button(hb, 60, 25, 0);
+  NSDictionary *menu = wait_menu(hb, 0);
+  CHECK(menu, "b's select opens a menu on b's host");
+  CHECK(!menu_after(ha, 0), "and not on a's");
+  answer(hb, menu, 1);
+  CHECK([e state:b where:^BOOL(NSDictionary *s) { return [s[@"title"] isEqual:@"b"]; }], "b takes its answer");
+  CHECK(![states_of(e, a, mark).lastObject[@"title"] isEqual:@"b"], "a's page is untouched");
+
+  [e call:@{@"cmd" : @"close", @"surface" : a}];
+  CHECK(wait_for(^{ return ha.detached; }, 3), "closing a detaches a's host");
+  CHECK(!hb.detached, "and not b's");
+  mark = hb.messages.count;
+  click_button(hb, 60, 25, 0);
+  menu = wait_menu(hb, mark);
+  answer(hb, menu, 3);
+  CHECK([e state:b where:^BOOL(NSDictionary *s) { return [s[@"title"] isEqual:@"c"]; }], "b still takes input");
+  detach(ha);
+  detach(hb);
+  [e.proc stop];
+}
+
+// A date picker is a popup widget: its own window in Chromium, which must
+// show over the page and take the clicks over it, as in OSR.
+static void test_windowed_date_picker_takes_clicks(void) {
+  Engine *e = start_engine();
+  NSString *sid = [e open:data_url(@"<title>date</title><body style='margin:0'><input type=date "
+                                   @"style='position:absolute;left:10px;top:10px;width:200px;height:30px' "
+                                   @"onclick='this.showPicker()' onchange='document.title=this.value'>")
+                transport:kWindowed];
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return titled(s, @"date"); }], "page loaded");
+  Host *h = attach_windowed(e, sid);
+  bowser_host_focus(h.handle, true);
+  click_button(h, 60, 25, 0);
+  pump(1); // the picker opens below the field
+  CHECK(!engine_window_on_screen(e), "the picker's window stays off screen");
+  click_button(h, 110, 170, 0); // a day, in the picker's grid
+  NSDictionary *s = [e state:sid where:^BOOL(NSDictionary *s) {
+    return [s[@"title"] rangeOfString:@"^\\d{4}-\\d\\d-\\d\\d$" options:NSRegularExpressionSearch].location != NSNotFound;
+  }];
+  CHECK(s, "a click on a day in the picker picks it: %s", e.log.lastObject.description.UTF8String);
+  detach(h);
+  [e.proc stop];
+}
+
+// Dragging a link out of a windowed page would put a drag image on the
+// user's screen. The drag ends at once instead, and the page goes on.
+static void test_windowed_drag_ends_at_once(void) {
+  Engine *e = start_engine();
+  NSString *sid = [e open:data_url(@"<title>drag</title><body style='margin:0'>"
+                                   @"<a href='https://example.com' style='font-size:40px'>link</a><script>"
+                                   @"let n = 0; onmousedown = () => document.title = 'down ' + ++n;"
+                                   @"ondragend = () => document.title = 'dragend';</script>")
+                transport:kWindowed];
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return titled(s, @"drag"); }], "page loaded");
+  Host *h = attach_windowed(e, sid);
+  bowser_host_focus(h.handle, true);
+  bowser_mouse_s m = {.action = BOWSER_MOUSE_DOWN, .x = 30, .y = 25, .click_count = 1};
+  bowser_host_mouse(h.handle, &m);
+  for (int i = 1; i <= 20; i++) {
+    pump(0.02);
+    m = (bowser_mouse_s){.action = BOWSER_MOUSE_DRAG, .x = 30 + i * 10, .y = 25 + i * 5};
+    bowser_host_mouse(h.handle, &m);
+  }
+  m = (bowser_mouse_s){.action = BOWSER_MOUSE_UP, .x = 230, .y = 125, .click_count = 1};
+  bowser_host_mouse(h.handle, &m);
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return [s[@"title"] isEqual:@"dragend"]; }],
+        "the drag ends: %s", [[e.log valueForKey:@"title"] componentsJoinedByString:@"|"].UTF8String);
+  CHECK(!engine_window_on_screen(e), "with nothing on screen");
+  click_button(h, 200, 150, 0);
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return [s[@"title"] isEqual:@"down 2"]; }],
+        "and the page takes clicks again");
+  detach(h);
+  [e.proc stop];
+}
+
+// What a user sees: real bowser-host windows, on the Mission Control Space
+// that BOWSER_SPACE names, captured window by window. Each windowed surface
+// must show its own page: the mirrors are per tab. Skipped without
+// BOWSER_SPACE, since it opens windows; the terminal needs Screen Recording.
+static rgb captured_center(int window) {
+  NSString *path = [NSTemporaryDirectory() stringByAppendingFormat:@"bowser-capture-%d.png", window];
+  NSTask *t = [NSTask launchedTaskWithLaunchPath:@"/usr/sbin/screencapture"
+                                       arguments:@[ @"-x", @"-o", @"-l", @(window).stringValue, path ]];
+  [t waitUntilExit];
+  CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], NULL);
+  CGImageRef image = src ? CGImageSourceCreateImageAtIndex(src, 0, NULL) : NULL;
+  rgb c = {0};
+  if (image) {
+    uint8_t px[4] = {0};
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef ctx = CGBitmapContextCreate(px, 1, 1, 8, 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+    CGContextDrawImage(ctx, CGRectMake(-(double)w / 2, -(double)h / 2, w, h), image);
+    c = (rgb){px[0], px[1], px[2]};
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+    CGImageRelease(image);
+  }
+  if (src) CFRelease(src);
+  [NSFileManager.defaultManager removeItemAtPath:path error:nil];
+  return c;
+}
+
+static void test_windowed_hosts_show_their_own_pages(void) {
+  NSString *space = NSProcessInfo.processInfo.environment[@"BOWSER_SPACE"];
+  if (!space) {
+    printf("     (skipped: set BOWSER_SPACE to a Space for host windows)\n");
+    return;
+  }
+  Engine *e = start_engine();
+  NSString *pages[2] = {@"<body style='margin:0;background:rgb(255,0,255)'>",
+                        @"<body style='margin:0;background:rgb(0,255,255)'>"};
+  Producer *hosts[2];
+  int windows[2] = {0};
+  for (int i = 0; i < 2; i++) {
+    NSString *sid = [e open:data_url(pages[i]) transport:kWindowed];
+    hosts[i] = [Producer spawn:@[ @"build/bowser-host", [e ticket:sid] ] tickets:0 env:@{@"BOWSER_SPACE" : space}];
+    NSString *line = [hosts[i] nextLine:10];
+    windows[i] = [line hasPrefix:@"window="] ? [[line substringFromIndex:7] intValue] : 0;
+    CHECK(windows[i], "bowser-host %d has a window: %s", i, line.UTF8String);
+  }
+  __block rgb a, b;
+  int first = windows[0], second = windows[1];
+  BOOL shown = wait_for(^{
+    a = captured_center(first);
+    b = captured_center(second);
+    return (BOOL)(near(a, MAGENTA) && near(b, CYAN));
+  }, 10);
+  CHECK(shown, "each host shows its own page: (%d,%d,%d) and (%d,%d,%d)", a.r, a.g, a.b, b.r, b.g, b.b);
+  CHECK(!engine_window_on_screen(e), "and the engine shows no window of its own");
+  for (int i = 0; i < 2; i++) [hosts[i] stop];
+  [e.proc stop];
+}
+
 static void remove_profiles(void) {
   for (NSString *path in profiles) [NSFileManager.defaultManager removeItemAtPath:path error:nil];
 }
@@ -505,6 +891,16 @@ int main(void) {
         {"the engine's death reaches every host", test_engine_death_reaches_every_host},
         {"the engine exits when its controller goes", test_engine_exits_when_its_controller_goes},
         {"a <select> popup shows over the page", test_select_popup_shows},
+        {"windowed: navigation reports url, title, and history", test_windowed_navigation_reports_state},
+        {"windowed: a tab with no host is hidden", test_windowed_tab_without_a_host_is_hidden},
+        {"windowed: key presses and IME text reach a field", test_windowed_keys_and_ime_reach_a_field},
+        {"windowed: a <select> is the host's menu", test_windowed_select_is_a_host_menu},
+        {"windowed: a context menu is the host's menu", test_context_menu_windowed},
+        {"osr: a context menu is the host's menu", test_context_menu_osr},
+        {"windowed: surfaces in one engine are isolated", test_windowed_surfaces_are_isolated},
+        {"windowed: a date picker takes clicks", test_windowed_date_picker_takes_clicks},
+        {"windowed: a drag out of the page ends at once", test_windowed_drag_ends_at_once},
+        {"windowed: real hosts show their own pages", test_windowed_hosts_show_their_own_pages},
     };
     atexit(remove_profiles);
     return run_tests(tests, sizeof tests / sizeof *tests);

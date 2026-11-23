@@ -218,6 +218,7 @@ static void pump(double seconds) {
 @property bowser_rect_s caret;
 @property BOOL gotCaret;
 @property BOOL composing;
+@property NSArray<NSValue *> *compositionRects; // bowser_rect_s, the newest
 @property bowser_cursor_e cursor;
 @property BOOL manual; // wakeups only count; the test ticks by hand
 @property int wakeups;
@@ -249,6 +250,9 @@ static void on_caret(void *ud, bowser_host_t *_, bowser_rect_s caret) {
 static void on_composition(void *ud, bowser_host_t *_, bool active, const bowser_rect_s *r, size_t n) {
   if (!from(ud).handle) from(ud).callbacksAfterDetach++;
   from(ud).composing = active;
+  NSMutableArray *rects = [NSMutableArray new];
+  for (size_t i = 0; i < n; i++) [rects addObject:[NSValue valueWithBytes:&r[i] objCType:@encode(bowser_rect_s)]];
+  from(ud).compositionRects = rects;
 }
 static void on_cursor(void *ud, bowser_host_t *_, bowser_cursor_e c) {
   if (!from(ud).handle) from(ud).callbacksAfterDetach++;
@@ -324,14 +328,17 @@ static int run_tests(const test_case *tests, size_t count) {
   [NSApplication sharedApplication];
   running = [NSMutableArray new];
   atexit(kill_running);
-  int failed = 0;
+  int failed = 0, ran = 0;
+  const char *only = getenv("BOWSER_TESTS"); // run the tests whose names contain it
   for (size_t i = 0; i < count; i++) {
+    if (only && !strstr(tests[i].name, only)) continue;
     int before = failures;
+    ran++;
     tests[i].fn();
     bool ok = failures == before;
     failed += !ok;
     printf("%s %s\n", ok ? "ok  " : "FAIL", tests[i].name);
   }
-  printf("\n%d passed, %d failed\n", (int)count - failed, failed);
+  printf("\n%d passed, %d failed\n", ran - failed, failed);
   return failed ? 1 : 0;
 }

@@ -128,9 +128,9 @@ typedef enum {
 // Sending: send functions never block. They queue the message and return.
 // Messages over 1 MiB are refused with BOWSER_ERR_INVALID. If the other side
 // stops reading for long enough that 4 MiB queue up, the library drops it and
-// reports BOWSER_ERR_STALLED. Latest-wins messages (resize, mouse move and
-// drag, caret, composition, cursor) replace older unsent ones of the same
-// kind, so a stalled peer costs a slot each, not a queue.
+// reports BOWSER_ERR_STALLED. Latest-wins messages (resize, display, mouse
+// move and drag, caret, composition, cursor) replace older unsent ones of the
+// same kind, so a stalled peer costs a slot each, not a queue.
 //
 // Config structs start with a size field and only grow at the end. Pass
 // sizeof your struct. The library accepts any size from the *_MIN_SIZE
@@ -176,6 +176,9 @@ typedef struct {
   void (*focus_cb)(void *ud, bowser_surface_t *, bool focused);
   void (*attach_cb)(void *ud, bowser_surface_t *, bool attached);
   void (*message_cb)(void *ud, bowser_surface_t *, const char *name, const char *body);
+  // The display the host shows the surface on (a CGDirectDisplayID), from
+  // bowser_host_set_display. For producers that pace frames to a display.
+  void (*display_cb)(void *ud, bowser_surface_t *, uint32_t display_id);
 } bowser_producer_config_s;
 
 // Ends at attach_cb, the last field before message_cb was added, so callers
@@ -258,6 +261,10 @@ bowser_result_e bowser_host_scroll(bowser_host_t *, const bowser_scroll_s *);
 bowser_result_e bowser_host_text(bowser_host_t *, const bowser_text_s *);
 // A message to the producer, in order with the input above. See "Messages".
 bowser_result_e bowser_host_send(bowser_host_t *, const char *name, const char *body);
+// The display the host layer is on, as a CGDirectDisplayID. Call it after
+// attaching and whenever the layer's window moves to another display.
+// Latest-wins. The producer's display_cb gets it.
+bowser_result_e bowser_host_set_display(bowser_host_t *, uint32_t display_id);
 
 #ifdef __cplusplus
 }

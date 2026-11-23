@@ -408,6 +408,12 @@ bowser_result_e bowser_host_resize(bowser_host_t *handle, bowser_size_s size) {
   return send_msg(h, BW_MSG_RESIZE, &b);
 }
 
+bowser_result_e bowser_host_set_display(bowser_host_t *h, uint32_t display_id) {
+  bw_buf b = {0};
+  bw_put_u32(&b, display_id);
+  return send_msg(H(h), BW_MSG_DISPLAY, &b);
+}
+
 bowser_result_e bowser_host_focus(bowser_host_t *h, bool focused) {
   bw_buf b = {0};
   bw_put_u8(&b, focused);

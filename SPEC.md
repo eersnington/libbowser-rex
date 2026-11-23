@@ -173,6 +173,7 @@ typedef struct {
   void (*focus_cb)(void *ud, bowser_surface_t *, bool focused);
   void (*attach_cb)(void *ud, bowser_surface_t *, bool attached);
   void (*message_cb)(void *ud, bowser_surface_t *, const char *name, const char *body);
+  void (*display_cb)(void *ud, bowser_surface_t *, uint32_t display_id); // CGDirectDisplayID
 } bowser_producer_config_s;
 
 bowser_result_e bowser_producer_new(const bowser_producer_config_s *, bowser_producer_t **out);
@@ -228,6 +229,8 @@ bowser_result_e bowser_host_mouse(bowser_host_t *, const struct bowser_mouse_s *
 bowser_result_e bowser_host_scroll(bowser_host_t *, const struct bowser_scroll_s *);
 bowser_result_e bowser_host_text(bowser_host_t *, const struct bowser_text_s *);
 bowser_result_e bowser_host_send(bowser_host_t *, const char *name, const char *body);
+// The display the host layer is on (a CGDirectDisplayID). Latest-wins.
+bowser_result_e bowser_host_set_display(bowser_host_t *, uint32_t display_id);
 
 void bowser_string_free(char *);
 ```
@@ -242,7 +245,7 @@ engine adapter defines its vocabulary (bowser-cef's is in
 - `name` is 1-64 of `[A-Za-z0-9_.-]`. `body` is UTF-8 (JSON by convention) or NULL, at most `BOWSER_MESSAGE_MAX` (64 KiB). Anything else is refused with `BOWSER_ERR_INVALID` at the call; the connection stays up.
 - Each direction is in order. Host messages share the input queue: never merged, never reordered against keys or text, and they hold their place when latest-wins input around them merges.
 - Nothing is kept for a host that isn't attached: `bowser_surface_send` returns `BOWSER_ERR_DISCONNECTED`. A producer sends its current state from `attach_cb`.
-- `message_cb` is the last field of both config structs. The `*_MIN_SIZE` constants still end at the field before it, so callers built before messages keep working and never have `message_cb` read past their struct.
+- `message_cb` follows `detached_cb`/`attach_cb`, and `display_cb` follows `message_cb` in the producer config. The `*_MIN_SIZE` constants still end before `message_cb`, so callers built before either keep working and never have them read past their struct.
 - A host that doesn't tick stops reading after 4096 unread messages, as a producer does with input.
 
 ### Input structs
@@ -321,7 +324,7 @@ libbowser/
 
 ## Open questions
 
-- **Ticket exchange.** Decided in step 1: a Unix socket in a 0700 directory carries control, the ticket is `bowser2:<socket path>#<token>`, and IOSURFACE frames use a bootstrap Mach service named in WELCOME.
+- **Ticket exchange.** Decided in step 1: a Unix socket in a 0700 directory carries control, the ticket is `bowser3:<socket path>#<token>`, and IOSURFACE frames use a bootstrap Mach service named in WELCOME.
 - **Rex integration.** Rex lists only first-party creators today. A browser block needs a creator API or first-party support.
 - **Who renders the cursor.** The producer sends a cursor shape and the host sets `NSCursor`. Custom image cursors need a bitmap path.
 - **Popups and `<select>` menus.** Decided: the producer composites them. CALAYERHOST adds a sublayer; IOSURFACE draws the popup into each frame. The host sees one surface.

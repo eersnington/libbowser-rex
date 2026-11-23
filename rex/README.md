@@ -22,7 +22,7 @@ Plugin log: `rex-client/dev/logs/plugin.log`. The engine's stderr goes there too
 | Method | Args | Result |
 |---|---|---|
 | `ticket` | none | `{"ticket"}`: fresh from the engine, single use, valid 60 s |
-| `state` | none | The newest `state` (see `adapters/cef/README.md`), plus `transport` and `engine_pid` (0 while the block has no surface) |
+| `state` | none | The newest `state` (see `adapters/cef/README.md`), plus `transport`, `mode` (`windowed`, the zero-copy default on `calayerhost`, or `osr`), and `engine_pid` (0 while the block has no surface) |
 | `navigate` | `{"url"}` | Loads what was typed: a URL, a host, or a search |
 | `back`, `forward`, `reload`, `stop` | none | |
 

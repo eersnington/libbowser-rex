@@ -221,7 +221,7 @@ static void conn_read(BWProducer *p, BWConn *c) {
       handle_ready(p, c);
       woke = true;
     } else if (c->state == CONN_LIVE &&
-               ((type >= BW_MSG_RESIZE && type <= BW_MSG_TEXT) || type == BW_MSG_MESSAGE)) {
+               ((type >= BW_MSG_RESIZE && type <= BW_MSG_TEXT) || type == BW_MSG_MESSAGE || type == BW_MSG_DISPLAY)) {
       enqueue(p, type, c->surface, &payload);
       woke = true;
       if (p->events.count >= MAX_EVENTS) {
@@ -490,6 +490,11 @@ static void dispatch_event(BWProducer *p, BWEvent *e) {
     if (cfg->message_cb) cfg->message_cb(ud, s, name, body);
     free(name);
     free(body);
+    break;
+  }
+  case BW_MSG_DISPLAY: {
+    uint32_t display = bw_get_u32(&r);
+    if (!r.err && cfg->display_cb) cfg->display_cb(ud, s, display);
     break;
   }
   }

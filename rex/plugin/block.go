@@ -43,6 +43,7 @@ type block struct {
 	mu      sync.Mutex // guards the fields below; never held across a call
 	eng     *engine
 	surface string
+	mode    string // the surface's mode: windowed or osr
 	url     string
 	state   engineEvent // the newest state event
 	label   string      // the label we last set
@@ -176,7 +177,7 @@ func (p *plugin) surface(b *block) (*engine, string, error) {
 	}
 	sid = r.str("surface")
 	b.mu.Lock()
-	b.eng, b.surface, b.state = e, sid, nil
+	b.eng, b.surface, b.mode, b.state = e, sid, r.str("mode"), nil
 	b.mu.Unlock()
 	return e, sid, nil
 }
@@ -393,6 +394,7 @@ func (b *block) describe() map[string]any {
 		out[k] = v
 	}
 	out["transport"] = b.transport
+	out["mode"] = b.mode
 	pid := 0
 	if b.eng != nil && b.eng.alive() && b.surface != "" {
 		pid = b.eng.cmd.Process.Pid

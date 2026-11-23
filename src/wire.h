@@ -8,7 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BW_TICKET_PREFIX "bowser2:" // bump when the wire format changes
+#define BW_TICKET_PREFIX "bowser3:" // bump when the wire format changes
 #define BW_TOKEN_LEN 32
 #define BW_MAX_FRAME (1u << 20)  // largest payload either side sends or accepts
 #define BW_MAX_QUEUED (4u << 20) // unsent bytes a connection holds before it drops the peer as stalled
@@ -24,6 +24,7 @@ typedef enum {
   BW_MSG_TEXT,      // u32 kind, str text, i64 sel loc, len, i64 repl loc, len
   BW_MSG_READY,     // empty; the host is set up, so the producer commits the attach
   BW_MSG_MESSAGE,   // str name, u8 has body, str body (BOWSER_MESSAGE_MAX); input, so it keeps its place
+  BW_MSG_DISPLAY,   // u32 CGDirectDisplayID
   // producer -> host
   BW_MSG_WELCOME = 100, // u32 transport, u32 context id, f64 w, h, scale, str mach service, u64 nonce
   BW_MSG_REJECT,        // u32 bowser_result_e

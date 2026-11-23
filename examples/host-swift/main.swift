@@ -1,5 +1,6 @@
 // A minimal AppKit host: mounts a bowser surface in a window and forwards
-// input, including IME text, through NSTextInputClient.
+// input, including IME text, through NSTextInputClient. Shows the producer's
+// `menu` messages as real menus (adapters/cef/README.md).
 //
 // Usage: bowser-host <ticket>
 import AppKit
@@ -173,6 +174,52 @@ func moveToSpace(_ window: NSWindow, index: Int) -> Bool {
   return true
 }
 
+// The `menu` message as an NSMenu. Each item's tag is its index in the
+// flattened list: depth first, separators and submenu items counted.
+final class MenuRunner: NSObject {
+  var chosen = -1
+
+  func build(_ items: [[String: Any]], into menu: NSMenu, next: inout Int) {
+    menu.autoenablesItems = false
+    for item in items {
+      let index = next
+      next += 1
+      if item["separator"] as? Bool == true {
+        menu.addItem(.separator())
+        continue
+      }
+      let m = NSMenuItem(title: item["label"] as? String ?? "", action: #selector(pick(_:)), keyEquivalent: "")
+      m.target = self
+      m.tag = index
+      m.isEnabled = item["enabled"] as? Bool ?? true
+      m.state = item["checked"] as? Bool == true ? .on : .off
+      if let children = item["children"] as? [[String: Any]] {
+        let sub = NSMenu()
+        build(children, into: sub, next: &next)
+        m.submenu = sub
+      }
+      menu.addItem(m)
+    }
+  }
+
+  @objc func pick(_ item: NSMenuItem) { chosen = item.tag }
+
+  // Shows the menu at (x, y) in the view (bowser points, top-left origin) and
+  // returns the chosen index, or -1.
+  func run(_ body: [String: Any], in view: NSView) -> Int {
+    let menu = NSMenu()
+    var next = 0
+    build(body["items"] as? [[String: Any]] ?? [], into: menu, next: &next)
+    let x = body["x"] as? Double ?? 0, y = body["y"] as? Double ?? 0
+    let at = NSPoint(x: x, y: view.isFlipped ? y : view.bounds.height - y)
+    // A <select> puts its selected item over the control, as NSPopUpButton does.
+    let selected = body["selected"] as? Int ?? -1
+    let positioned = body["kind"] as? String == "select" ? menu.items.first { $0.tag == selected } : nil
+    menu.popUp(positioning: positioned, at: at, in: view)
+    return chosen
+  }
+}
+
 final class App: NSObject, NSApplicationDelegate {
   let ticket: String
   var window: NSWindow!
@@ -215,6 +262,19 @@ final class App: NSObject, NSApplicationDelegate {
       App.from(ud).view.cursor = cursor
       cursor.set()
     }
+    cfg.message_cb = { ud, _, name, body in
+      guard let name, String(cString: name) == "menu", let body,
+        let json = try? JSONSerialization.jsonObject(with: Data(String(cString: body).utf8)) as? [String: Any],
+        let id = json["id"] as? Int
+      else { return }
+      let app = App.from(ud)
+      // After this tick, from the run loop rather than the main queue, so
+      // the menu's own run loop keeps ticking the host.
+      RunLoop.main.perform {
+        let index = MenuRunner().run(json, in: app.view)
+        if let h = app.host { bowser_host_send(h, "menu_result", "{\"id\":\(id),\"index\":\(index)}") }
+      }
+    }
     cfg.detached_cb = { ud, _, why in
       let app = App.from(ud)
       print("detached: \(why.rawValue)")
@@ -232,6 +292,11 @@ final class App: NSObject, NSApplicationDelegate {
     window.title = "bowser host (\(transport))"
     view.mount(h)
     window.makeFirstResponder(view)
+    // The producer paces frames to the display the surface is on.
+    sendDisplay()
+    NotificationCenter.default.addObserver(
+      forName: NSWindow.didChangeScreenNotification, object: window, queue: .main
+    ) { [weak self] _ in self?.sendDisplay() }
     if let space = ProcessInfo.processInfo.environment["BOWSER_SPACE"].flatMap(Int.init) {
       // Don't activate: that would switch the user to the window's Space.
       if !moveToSpace(window, index: space) { print("no Space \(space)") }
@@ -242,6 +307,12 @@ final class App: NSObject, NSApplicationDelegate {
     }
     print("window=\(window.windowNumber)")
     fflush(stdout)
+  }
+
+  func sendDisplay() {
+    guard let host, let n = window.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+    else { return }
+    bowser_host_set_display(host, n.uint32Value)
   }
 
   static func from(_ ud: UnsafeMutableRawPointer?) -> App {

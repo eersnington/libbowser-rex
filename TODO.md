@@ -46,6 +46,10 @@ CEF 158.0.3 (Chromium 158.0.8127.18), C API, sandboxed helpers.
 - [x] One engine, many surfaces: each surface is a browser; one persistent profile (`--profile`); control on stdin/stdout
 - [x] Browser messages: navigate, history, reload/stop, edit commands, find, zoom; `state` and `find_result` back (`adapters/cef/README.md`)
 - [x] `<select>` and other popups composited on both transports
+- [x] Windowed zero-copy mode (`--mode windowed`), the default on CALAYERHOST: one hidden window per tab, Chromium's GPU layers mirrored into the surface (`docs/perf.md`)
+- [x] Menus on the host: `menu` / `menu_result` for `<select>` (windowed) and context menus (both modes)
+- [x] `bowser_host_set_display`: windowed tabs pace frames to the host's display
+- [ ] Per-character composition rects in windowed mode: Chromium answers every range with the caret
 
 Memory, Wikipedia's "Web browser" in hidden tabs, after load, summed over
 the engine and all its helpers (`footprint` is what Activity Monitor shows):

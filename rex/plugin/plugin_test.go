@@ -194,9 +194,12 @@ func (r *fakeRex) call(method string, payload any) (json.RawMessage, *rpcError) 
 }
 
 func (r *fakeRex) create(sessionBlock, page string) string {
+	return r.createWith(sessionBlock, map[string]any{"url": page, "transport": "iosurface"})
+}
+
+func (r *fakeRex) createWith(sessionBlock string, options map[string]any) string {
 	out, err := r.call("block.create", map[string]any{
-		"flavor": flavorName, "session_id": "session:test", "block_id": sessionBlock,
-		"options": map[string]any{"url": page, "transport": "iosurface"},
+		"flavor": flavorName, "session_id": "session:test", "block_id": sessionBlock, "options": options,
 	})
 	if err != nil {
 		r.t.Fatalf("block.create: %v", err)
@@ -270,7 +273,7 @@ func titled(title string) func(map[string]any) bool {
 func TestBlocksShareOneEngineAndStayApart(t *testing.T) {
 	r := startRex(t)
 	a := r.create("block:a", page("Alpha"))
-	b := r.create("block:b", page("Beta"))
+	b := r.createWith("block:b", map[string]any{"url": page("Beta")}) // the defaults
 	r.event(a, "state", titled("Alpha"))
 	r.event(b, "state", titled("Beta"))
 	sa, _ := r.method(a, "state", nil)
@@ -278,7 +281,11 @@ func TestBlocksShareOneEngineAndStayApart(t *testing.T) {
 	if sa["engine_pid"] == 0.0 || sa["engine_pid"] != sb["engine_pid"] {
 		t.Fatalf("both blocks are surfaces of one engine: %v and %v", sa["engine_pid"], sb["engine_pid"])
 	}
-	if tk, err := r.method(a, "ticket", nil); err != nil || !strings.HasPrefix(tk["ticket"].(string), "bowser2:") {
+	if sb["transport"] != "calayerhost" || sb["mode"] != "windowed" || sa["mode"] != "osr" {
+		t.Fatalf("a block is zero copy by default, and OSR on iosurface: %v/%v and %v/%v", sb["transport"],
+			sb["mode"], sa["transport"], sa["mode"])
+	}
+	if tk, err := r.method(a, "ticket", nil); err != nil || !strings.HasPrefix(tk["ticket"].(string), "bowser3:") {
 		t.Fatalf("ticket: %v %v", tk, err)
 	}
 
