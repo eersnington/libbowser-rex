@@ -26,6 +26,7 @@ char *bowser_mirror_field(id object, const char *name);
 char *bowser_mirror_tree(id object, long depth);
 // From RexBowser.swift.
 void rex_bowser_install(void);
+BOOL rex_bowser_handle_key(NSEvent *event);
 
 static void trace(const char *fmt, ...) {
   const char *path = getenv("BOWSER_REX_TRACE");
@@ -126,6 +127,13 @@ static void bowser_orderWindow(NSWindow *self, SEL _cmd, NSWindowOrderingMode mo
   ((void (*)(id, SEL, NSWindowOrderingMode, NSInteger))orig_orderWindow)(self, _cmd, mode, other);
 }
 
+// Browser panes see ⌘ keys before Rex does (RexBowser.swift decides which).
+static IMP orig_sendEvent;
+static void bowser_sendEvent(NSApplication *self, SEL _cmd, NSEvent *event) {
+  if (event.type == NSEventTypeKeyDown && rex_bowser_handle_key(event)) return;
+  ((void (*)(id, SEL, NSEvent *))orig_sendEvent)(self, _cmd, event);
+}
+
 static IMP orig_activate, orig_activateIgnoring;
 static void bowser_noop(id self, SEL _cmd) {}
 static void bowser_noop_bool(id self, SEL _cmd, BOOL flag) {}
@@ -152,10 +160,25 @@ static void dump(NSView *v, int depth, NSMutableString *out) {
   for (NSView *s in v.subviews) dump(s, depth + 1, out);
 }
 
+static void dump_menu(NSMenu *menu, NSString *path, NSMutableString *out) {
+  for (NSMenuItem *item in menu.itemArray) {
+    NSString *here = path.length ? [NSString stringWithFormat:@"%@ > %@", path, item.title] : item.title;
+    if (item.keyEquivalent.length) {
+      NSEventModifierFlags m = item.keyEquivalentModifierMask;
+      [out appendFormat:@"menu %@%@%@%@%@  %@  action=%@\n", m & NSEventModifierFlagControl ? @"⌃" : @"",
+                        m & NSEventModifierFlagOption ? @"⌥" : @"", m & NSEventModifierFlagShift ? @"⇧" : @"",
+                        m & NSEventModifierFlagCommand ? @"⌘" : @"", item.keyEquivalent, here,
+                        item.action ? NSStringFromSelector(item.action) : @"-"];
+    }
+    if (item.submenu) dump_menu(item.submenu, here, out);
+  }
+}
+
 static void dump_all(void) {
   const char *path = getenv("BOWSER_REX_DUMP");
   if (!path) return;
   NSMutableString *out = [NSMutableString new];
+  dump_menu(NSApp.mainMenu, @"", out);
   for (NSWindow *w in NSApp.windows) {
     [out appendFormat:@"== window %ld %@ %@ visible=%d\n", (long)w.windowNumber, NSStringFromClass(w.class),
                       w.title, w.visible];
@@ -164,8 +187,70 @@ static void dump_all(void) {
   [out writeToFile:@(path) atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
+// ---- Synthetic keys (dev hook) ---------------------------------------------
+// SIGINFO: send each line of BOWSER_REX_KEYS through NSApp.sendEvent, the same
+// path real keys take (key equivalents, menus, the responder chain).
+// Lines: "cmd+l", "cmd+shift+g", "enter", "esc", "tab", "type:some text".
+
+static void send_key(NSWindow *w, NSString *chars, unsigned short code, NSEventModifierFlags mods) {
+  NSEventType types[] = {NSEventTypeKeyDown, NSEventTypeKeyUp};
+  for (int i = 0; i < 2; i++) {
+    NSEventType t = types[i];
+    NSEvent *e = [NSEvent keyEventWithType:t
+                                  location:NSZeroPoint
+                             modifierFlags:mods
+                                 timestamp:NSProcessInfo.processInfo.systemUptime
+                              windowNumber:w.windowNumber
+                                   context:nil
+                                characters:chars
+               charactersIgnoringModifiers:chars
+                                 isARepeat:NO
+                                   keyCode:code];
+    [NSApp sendEvent:e];
+  }
+}
+
+static void play_keys(void) {
+  const char *path = getenv("BOWSER_REX_KEYS");
+  NSWindow *w = NSApp.keyWindow ?: NSApp.mainWindow ?: NSApp.orderedWindows.firstObject;
+  if (!path || !w) return;
+  NSDictionary *codes = @{@"l" : @37, @"f" : @3, @"r" : @15, @"g" : @5, @"c" : @8, @"v" : @9, @"a" : @0,
+                          @"=" : @24, @"-" : @27, @"0" : @29};
+  NSString *all = [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:nil];
+  for (NSString *line in [all componentsSeparatedByString:@"\n"]) {
+    if (!line.length) continue;
+    trace("key %s", line.UTF8String);
+    if ([line hasPrefix:@"type:"]) {
+      NSString *text = [line substringFromIndex:5];
+      for (NSUInteger i = 0; i < text.length; i++) send_key(w, [text substringWithRange:NSMakeRange(i, 1)], 0, 0);
+    } else if ([line isEqualToString:@"enter"]) {
+      send_key(w, @"\r", 36, 0);
+    } else if ([line isEqualToString:@"esc"]) {
+      send_key(w, @"\x1b", 53, 0);
+    } else if ([line isEqualToString:@"tab"]) {
+      send_key(w, @"\t", 48, 0);
+    } else {
+      NSArray *parts = [line componentsSeparatedByString:@"+"];
+      NSEventModifierFlags mods = 0;
+      for (NSString *p in parts) {
+        if ([p isEqualToString:@"cmd"]) mods |= NSEventModifierFlagCommand;
+        if ([p isEqualToString:@"shift"]) mods |= NSEventModifierFlagShift;
+        if ([p isEqualToString:@"opt"]) mods |= NSEventModifierFlagOption;
+      }
+      NSString *k = parts.lastObject;
+      send_key(w, k, [codes[k] unsignedShortValue], mods);
+    }
+  }
+}
+
 __attribute__((constructor)) static void bowser_rex_init(void) {
+  signal(SIGINFO, SIG_IGN);
+  static dispatch_source_t keys;
+  keys = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGINFO, 0, dispatch_get_main_queue());
+  dispatch_source_set_event_handler(keys, ^{ play_keys(); });
+  dispatch_resume(keys);
   trace("loaded pid=%d", getpid());
+  swizzle(NSApplication.class, @selector(sendEvent:), (IMP)bowser_sendEvent, &orig_sendEvent);
   // Rex's classes are ready once the main run loop starts.
   dispatch_async(dispatch_get_main_queue(), ^{ rex_bowser_install(); });
   if (getenv("BOWSER_SPACE")) {

@@ -22,7 +22,27 @@ rex-client/run.sh stop
 | `rexinject.m` | Injected library: puts every window on Space `BOWSER_SPACE` before ordering it in, makes app activation a no-op, opens a window on `SIGUSR2` (a reopen Apple Event to itself), and dumps the view tree on `SIGUSR1`. |
 | `RexBowser.swift` | Hooks `NativePaneView.layout`. It reads the pane's block from `cell.context.pane.block` with `Mirror`. For `dev.libbowser` blocks it puts a `BowserPaneView` over the unsupported-block placeholder, asks the block for a ticket (`rex block call <block> dev.libbowser.ticket`), and attaches. |
 
-Dev hooks: `BOWSER_REX_CREATOR` treats another creator's blocks as ours, and
+| `BrowserChrome.swift` | The pane's native chrome: an address bar (⌘L), a find bar (⌘F), and a loading line. They float over the page, so showing them never resizes it. |
+
+## Keys in a browser pane
+
+Rex consumes its menu shortcuts before views see them, so the injected
+library checks keys in `NSApplication.sendEvent` first, and only while the
+keyboard is in a browser pane:
+
+| Keys | Go to |
+|---|---|
+| ⌘A ⌘C ⌘V ⌘X ⌘Z ⇧⌘Z | The responder chain: the page, or the address/find field being typed in |
+| ⌘L, ⌘R, ⌘F, ⌘G, ⇧⌘G, ⌘+ ⌘- ⌘0 | The page: address bar, reload, find, zoom |
+| Everything else, including ⌘[ ⌘] | Rex, unchanged |
+
+Mouse buttons 4 and 5 go back and forward. A click in the page focuses the pane
+with Rex's own `onFocus` action, and Rex focusing the pane gives the page the
+keyboard.
+
+Dev hooks: `BOWSER_REX_KEYS` + `kill -INFO` replays key lines (`cmd+l`,
+`type:text`, `enter`, `esc`) through `NSApp.sendEvent`, for testing without
+clicking. `BOWSER_REX_CREATOR` treats another creator's blocks as ours, and
 `BOWSER_REX_TICKET` uses a fixed ticket instead of asking the block.
 
 ## What first-party Rex support would need

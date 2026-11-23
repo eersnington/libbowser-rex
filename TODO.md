@@ -94,7 +94,10 @@ paint callback; CPU is `ps` CPU time over the scroll, as % of one core.
 - [x] Producers mint tickets on request (the engine's `ticket` command) instead of a batch of 16
 - [x] One bowser-cef for all browser blocks; restarted on the next call after it dies; blocks get an `error` event
 - [x] Block methods `navigate`, `back`, `forward`, `reload`, `stop`; `state` event; block label follows the page title
-- [ ] Pane focus: clicking a bowser pane should also move Rex's focus to that block
+- [x] Pane focus: a click calls Rex's `onFocus`; Rex focus gives the page the keyboard
+- [x] Native chrome: address bar (⌘L), find bar (⌘F), loading line; Edit menu keys; reload, zoom
+- [ ] Back/forward gestures: two-finger swipe (mouse buttons 4/5 work)
+- [ ] Context menus (the engine suppresses them; show a native NSMenu from the host)
 - [x] One dev harness: `rex-client/run.sh` (`rex/dev-server.sh` is gone)
 - [ ] Share the host view between `examples/host-swift` and `rex-client/RexBowser.swift`
 

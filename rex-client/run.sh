@@ -22,7 +22,7 @@ build() {
   clang -fobjc-arc -c "$here/rexinject.m" -o "$dev/rexinject.o"
   make -s -C "$here/.." build/libbowser.a
   swiftc -O -parse-as-library -emit-library -import-objc-header "$here/../include/bowser.h" \
-    "$here/mirror.swift" "$here/RexBowser.swift" "$dev/rexinject.o" "$here/../build/libbowser.a" \
+    "$here/mirror.swift" "$here/RexBowser.swift" "$here/BrowserChrome.swift" "$dev/rexinject.o" "$here/../build/libbowser.a" \
     -Xlinker -framework -Xlinker AppKit -Xlinker -framework -Xlinker Carbon \
     -Xlinker -framework -Xlinker QuartzCore -Xlinker -framework -Xlinker IOSurface -o "$dev/rexinject.dylib"
   printf '#!/bin/sh\nexec rex --autostart=false -S unix://%s/s.sock "$@"\n' "$dev" > "$dev/rexdev"
@@ -68,7 +68,7 @@ client)
   make_app
   rm -f "$dev/trace.log"
   REX_SERVER="unix://$dev/s.sock" BOWSER_REX_CLI="$(command -v rex)" BOWSER_REX_SOCKET="$dev/s.sock" BOWSER_SPACE="$space" \
-    BOWSER_REX_TRACE="$dev/trace.log" BOWSER_REX_DUMP="$dev/views.txt" \
+    BOWSER_REX_TRACE="$dev/trace.log" BOWSER_REX_DUMP="$dev/views.txt" BOWSER_REX_KEYS="$dev/keys.txt" \
     DYLD_INSERT_LIBRARIES="$dev/rexinject.dylib" \
     "$dev/launch" "$here/sandbox.sb" "$app/Contents/MacOS/Rex" < /dev/null > "$dev/client.log" 2>&1 &
   pid=$!

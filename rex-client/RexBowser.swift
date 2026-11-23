@@ -53,6 +53,16 @@ func paneBlock(_ pane: NSView) -> PaneBlock? {
     blockID: id, creator: child(block, ["creatorName"]) as? String, flavor: child(block, ["flavor"]) as? String)
 }
 
+/// Rex's own "focus this pane" action, as its header uses it.
+func paneFocusAction(_ pane: NSView) -> (() -> Void)? {
+  child(pane, ["cell", "state", "headerActions", "onFocus"]) as? () -> Void
+}
+
+/// Whether Rex considers `blockID` the focused block of the pane's window.
+func paneIsFocused(_ pane: NSView, blockID: String) -> Bool {
+  (child(pane, ["cell", "window", "focusedBlockID", "rawValue"]) as? String) == blockID
+}
+
 // MARK: - Ticket from the block
 
 /// Ask the block for a fresh ticket through the Rex CLI (`ticket` is a method
@@ -98,6 +108,7 @@ private func findTicket(_ json: Any?) -> String? {
 
 final class BowserPaneView: NSView, NSTextInputClient {
   let blockID: String
+  weak var pane: NSView?
   private var host: OpaquePointer?
   private var attaching = false
   private var caret = bowser_rect_s()
@@ -105,11 +116,22 @@ final class BowserPaneView: NSView, NSTextInputClient {
   private var marked = NSAttributedString()
   private var cursor = NSCursor.arrow
 
+  private(set) var state = BrowserState()
+  private lazy var addressBar = AddressBar(send: { [weak self] in self?.send($0, $1) })
+  private lazy var findBar = FindBar(send: { [weak self] in self?.send($0, $1) })
+  private let progressLine = ProgressLine()
+
   init(blockID: String) {
     self.blockID = blockID
     super.init(frame: .zero)
     wantsLayer = true
-    layer?.backgroundColor = NSColor.black.cgColor
+    for bar in [addressBar, findBar] as [NSView] {
+      bar.isHidden = true
+      addSubview(bar)
+    }
+    addSubview(progressLine)
+    addressBar.onDismiss = { [weak self] in self?.dismiss(self?.addressBar) }
+    findBar.onDismiss = { [weak self] in self?.dismiss(self?.findBar) }
     addTrackingArea(NSTrackingArea(
       rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
       owner: self))
@@ -118,6 +140,11 @@ final class BowserPaneView: NSView, NSTextInputClient {
 
   override var acceptsFirstResponder: Bool { true }
   override var isFlipped: Bool { true }
+  override var wantsUpdateLayer: Bool { true }
+
+  // Shows only where no frame covers yet, such as the strip a growing pane
+  // reveals for a frame. Most pages draw on the system text background.
+  override func updateLayer() { layer?.backgroundColor = NSColor.textBackgroundColor.cgColor }
 
   // MARK: Attach and detach follow the window
 
@@ -157,17 +184,28 @@ final class BowserPaneView: NSView, NSTextInputClient {
         BowserPaneView.from(ud).compositionRects = active ? Array(UnsafeBufferPointer(start: rects, count: n)) : []
       }
       cfg.cursor_cb = { ud, _, c in BowserPaneView.from(ud).setCursor(c) }
+      cfg.message_cb = { ud, _, name, body in
+        // Copy now: the strings are only valid during the callback.
+        BowserPaneView.from(ud).receive(String(cString: name!), body.map { String(cString: $0) })
+      }
       cfg.detached_cb = { ud, _, why in
         let view = BowserPaneView.from(ud)
         rexTrace("block \(view.blockID): detached (\(why.rawValue))")
         view.detach()
       }
       var h: OpaquePointer?
-      guard bowser_host_attach(ticket, &cfg, &h) == BOWSER_OK, let h else {
+      let rc = bowser_host_attach(ticket, &cfg, &h)
+      guard rc == BOWSER_OK, let h else {
         rexTrace("block \(self.blockID): attach failed: \(String(cString: bowser_last_error()))")
+        // A used or expired ticket: ask the block for a fresh one.
+        if rc == BOWSER_ERR_TICKET, attempt < 12 {
+          self.attaching = true
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.requestTicket(attempt: attempt + 1) }
+        }
         return
       }
       self.host = h
+      self.sentSize = nil
       self.layer?.addSublayer(bowser_host_layer(h))
       self.needsLayout = true
       rexTrace("block \(self.blockID): attached")
@@ -184,15 +222,183 @@ final class BowserPaneView: NSView, NSTextInputClient {
     Unmanaged<BowserPaneView>.fromOpaque(ud!).takeUnretainedValue()
   }
 
+  private var sentSize: bowser_size_s?
+
   override func layout() {
     super.layout()
+    layoutChrome()
     guard let host else { return }
+    let size = bowser_size_s(width: bounds.width, height: bounds.height, scale: Double(window?.backingScaleFactor ?? 2))
+    // Rex lays panes out often; only a real change reaches the engine, where a
+    // resize means a page relayout.
+    if let s = sentSize, s.width == size.width, s.height == size.height, s.scale == size.scale { return }
+    sentSize = size
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     bowser_host_layer(host).frame = bounds
     CATransaction.commit()
-    bowser_host_resize(host, bowser_size_s(width: bounds.width, height: bounds.height,
-                                           scale: Double(window?.backingScaleFactor ?? 2)))
+    bowser_host_resize(host, size)
+  }
+
+
+  // MARK: Chrome
+
+  private func layoutChrome() {
+    let inset: CGFloat = 8, height: CGFloat = 34
+    progressLine.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 2)
+    let addressWidth = min(bounds.width - 2 * inset, 720)
+    addressBar.frame = NSRect(x: (bounds.width - addressWidth) / 2, y: inset, width: addressWidth, height: height)
+    let findWidth = min(bounds.width - 2 * inset, 380)
+    findBar.frame = NSRect(x: bounds.width - findWidth - inset, y: inset, width: findWidth, height: height)
+  }
+
+  private func send(_ name: String, _ body: [String: Any]?) {
+    guard let host else { return }
+    var json: String?
+    if let body, let data = try? JSONSerialization.data(withJSONObject: body) {
+      json = String(data: data, encoding: .utf8)
+    }
+    let rc = bowser_host_send(host, name, json)
+    rexTrace("send \(name) \(json ?? "") -> \(rc.rawValue)")
+  }
+
+  fileprivate func receive(_ name: String, _ body: String?) {
+    switch name {
+    case "state":
+      guard let s = BrowserState(json: body) else { return }
+      state = s
+      addressBar.update(s)
+      progressLine.update(loading: s.loading, progress: s.progress)
+    case "menu":
+      showMenu(body)
+    case "find_result":
+      guard let data = body?.data(using: .utf8),
+        let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+      else { return }
+      findBar.update(count: o["count"] as? Int ?? 0, active: o["active"] as? Int ?? 0)
+    default:
+      break
+    }
+  }
+
+
+  // MARK: Native menus
+
+  private var pickedMenuIndex = -1
+
+  /// The engine's `menu` message (a `<select>` list or a context menu) as a
+  /// real NSMenu in this process. Items are numbered depth-first, separators
+  /// included, as adapters/cef/README.md specifies; the pick goes back in
+  /// `menu_result`.
+  private func showMenu(_ body: String?) {
+    guard let data = body?.data(using: .utf8),
+      let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let id = o["id"] as? Int, let items = o["items"] as? [[String: Any]]
+    else { return }
+    let menu = NSMenu()
+    menu.autoenablesItems = false
+    var next = 0
+    func build(_ items: [[String: Any]], into m: NSMenu) {
+      for item in items {
+        let index = next
+        next += 1
+        if item["separator"] as? Bool == true {
+          m.addItem(.separator())
+          continue
+        }
+        let mi = NSMenuItem(title: item["label"] as? String ?? "", action: #selector(pickMenuItem(_:)), keyEquivalent: "")
+        mi.target = self
+        mi.tag = index
+        mi.isEnabled = item["enabled"] as? Bool ?? true
+        mi.state = item["checked"] as? Bool == true ? .on : .off
+        if let children = item["children"] as? [[String: Any]], !children.isEmpty {
+          let sub = NSMenu()
+          sub.autoenablesItems = false
+          build(children, into: sub)
+          mi.submenu = sub
+          mi.action = nil
+        }
+        m.addItem(mi)
+      }
+    }
+    build(items, into: menu)
+    let at = NSPoint(x: o["x"] as? Double ?? 0, y: o["y"] as? Double ?? 0)  // flipped view: top-left, like the engine
+    // A <select> opens with its current item over the control, as native pop-up buttons do.
+    let selected = o["selected"] as? Int ?? -1
+    let positioning = o["kind"] as? String == "select" && selected >= 0 ? menu.item(withTag: selected) : nil
+    pickedMenuIndex = -1
+    menu.popUp(positioning: positioning, at: at, in: self)  // returns when the menu closes
+    send("menu_result", ["id": id, "index": pickedMenuIndex])
+  }
+
+  @objc private func pickMenuItem(_ item: NSMenuItem) { pickedMenuIndex = item.tag }
+
+  private func show(_ bar: NSView) {
+    bar.isHidden = false
+    layoutChrome()
+    if bar === addressBar { addressBar.update(state); addressBar.focus() } else { findBar.focus() }
+  }
+
+  private func dismiss(_ bar: NSView?) {
+    bar?.isHidden = true
+    window?.makeFirstResponder(self)
+  }
+
+  /// Browser keys while the page or its chrome has the keyboard. Called from
+  /// the NSApplication.sendEvent hook, before Rex sees the key: Rex consumes
+  /// its menu shortcuts (⌘A, ⌘F, ⌘R, …) before the views' key-equivalent pass.
+  /// Rex keeps every other ⌘ key, including ⌘[ and ⌘] for pane focus.
+  func handleBrowserKey(_ e: NSEvent, in window: NSWindow) -> Bool {
+    guard host != nil else { return false }
+    let mods = e.modifierFlags.intersection([.command, .shift, .option, .control])
+    let key = e.charactersIgnoringModifiers?.lowercased() ?? ""
+    // Edit keys go to the first responder: the page, or the field editor when
+    // the address or find bar is being typed in, which then behaves natively.
+    let edit: Selector? =
+      switch (mods, key) {
+      case ([.command], "a"): #selector(NSResponder.selectAll(_:))
+      case ([.command], "c"): #selector(NSText.copy(_:))
+      case ([.command], "x"): #selector(NSText.cut(_:))
+      case ([.command], "v"): #selector(NSText.paste(_:))
+      case ([.command], "z"): #selector(BowserPaneView.undo(_:))  // same "undo:" a text field answers
+      case ([.command, .shift], "z"): #selector(BowserPaneView.redo(_:))
+      default: nil
+      }
+    // Walk the responder chain of the window the key went to (not NSApp's key
+    // window, which a background window isn't).
+    if let edit { return window.firstResponder?.tryToPerform(edit, with: self) ?? false }
+    switch (mods, key) {
+    case ([.command], "l"): show(addressBar)
+    case ([.command], "r"), ([.command, .shift], "r"): send("reload", nil)
+    case ([.command], "f"): show(findBar)
+    case ([.command], "g"): findBar.findNext()
+    case ([.command, .shift], "g"): findBar.findPrevious()
+    case ([.command], "="), ([.command], "+"), ([.command, .shift], "="), ([.command, .shift], "+"):
+      send("zoom", ["delta": 1])
+    case ([.command], "-"): send("zoom", ["delta": -1])
+    case ([.command], "0"): send("zoom", ["delta": 0])
+    default: return false
+    }
+    return true
+  }
+
+  // Rex's Edit menu sends these down the responder chain.
+  @objc func copy(_ sender: Any?) { send("edit", ["command": "copy"]) }
+  @objc func cut(_ sender: Any?) { send("edit", ["command": "cut"]) }
+  @objc func paste(_ sender: Any?) { send("edit", ["command": "paste"]) }
+  @objc override func selectAll(_ sender: Any?) { send("edit", ["command": "select_all"]) }
+  @objc func undo(_ sender: Any?) { send("edit", ["command": "undo"]) }
+  @objc func redo(_ sender: Any?) { send("edit", ["command": "redo"]) }
+  @objc func delete(_ sender: Any?) { send("edit", ["command": "delete"]) }
+
+  @objc func validateMenuItem(_ item: NSMenuItem) -> Bool { host != nil }
+
+  override func otherMouseDown(with e: NSEvent) {
+    switch e.buttonNumber {
+    case 3: send("back", nil)
+    case 4: send("forward", nil)
+    default: super.otherMouseDown(with: e)
+    }
   }
 
   private func setCursor(_ c: bowser_cursor_e) {
@@ -224,6 +430,9 @@ final class BowserPaneView: NSView, NSTextInputClient {
   }
 
   override func mouseDown(with e: NSEvent) {
+    // Tell Rex first, the way its pane header does, so its focus and the
+    // inactive-pane fade follow the click.
+    if let pane, !paneIsFocused(pane, blockID: blockID) { paneFocusAction(pane)?() }
     window?.makeFirstResponder(self)
     mouse(e, BOWSER_MOUSE_DOWN, 0)
   }
@@ -330,7 +539,8 @@ final class BowserPaneView: NSView, NSTextInputClient {
 
 private var mountKey: UInt8 = 0
 
-/// Called after every NativePaneView layout.
+/// Called after every NativePaneView layout. Costs about 0.1 ms (measured
+/// over 50 calls while resizing splits), so it can run on every layout.
 func reconcilePane(_ pane: NSView) {
   let mounted = objc_getAssociatedObject(pane, &mountKey) as? BowserPaneView
   let block = paneBlock(pane)
@@ -354,13 +564,45 @@ func reconcilePane(_ pane: NSView) {
   } else {
     view = BowserPaneView(blockID: wanted.blockID)
     objc_setAssociatedObject(pane, &mountKey, view, .OBJC_ASSOCIATION_RETAIN)
-    rexTrace("block \(wanted.blockID): mounting (\(wanted.flavor ?? "?"))")
+    rexTrace("block \(wanted.blockID): mounting (\(wanted.flavor ?? "?")), focus action \(paneFocusAction(pane) != nil ? "found" : "missing")")
   }
   if view.superview !== flipped {
     flipped.addSubview(view, positioned: .above, relativeTo: content)
   }
+  view.pane = pane
   content.isHidden = true
   if view.frame != content.frame { view.frame = content.frame }
+
+  // Rex moved focus here (⌘], a click on the header, the API): take the
+  // keyboard, unless something inside the view already has it.
+  if paneIsFocused(pane, blockID: wanted.blockID), let window = view.window,
+    !((window.firstResponder as? NSView)?.isDescendant(of: view) ?? false)
+  {
+    window.makeFirstResponder(view)
+    rexTrace("block \(wanted.blockID): took focus from Rex")
+  }
+}
+
+/// The BowserPaneView that has the keyboard in `window`, if any: the page
+/// itself, or a field in its chrome (whose field editor is the first
+/// responder, with the field as its delegate).
+private func keyboardPane(in window: NSWindow) -> BowserPaneView? {
+  var view: NSView? = window.firstResponder as? NSView
+  if let editor = view as? NSTextView, editor.isFieldEditor { view = editor.delegate as? NSView }
+  while let v = view {
+    if let pane = v as? BowserPaneView { return pane }
+    view = v.superview
+  }
+  return nil
+}
+
+/// From the NSApplication.sendEvent hook: true when a browser pane took the key.
+@_cdecl("rex_bowser_handle_key")
+public func rexBowserHandleKey(_ event: NSEvent) -> Bool {
+  guard event.type == .keyDown, event.modifierFlags.contains(.command),
+    let window = event.window ?? NSApp.keyWindow, let pane = keyboardPane(in: window)
+  else { return false }
+  return pane.handleBrowserKey(event, in: window)
 }
 
 private var originalLayout: IMP?
