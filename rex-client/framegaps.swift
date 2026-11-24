@@ -83,8 +83,10 @@ if args.count == 3, args[1] == "stream" {
     if on { print("{\"w\":\(id),\"ts\":\(ts)}") }
   }
   _ = streams
+  let parent = getppid()
   while true {
     try await Task.sleep(for: .milliseconds(250))
+    if getppid() != parent { exit(0) }  // the recorder is gone
     for id in ids {
       let on = onScreen(id)
       let was = lock.withLock {

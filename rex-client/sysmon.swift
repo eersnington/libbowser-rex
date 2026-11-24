@@ -114,8 +114,10 @@ setvbuf(stdout, nil, _IOLBF, 0)
 let stream = args[2] == "-"
 if stream { print(lines[0]) }
 let end = secs > 0 ? prevT + secs * 1e6 : .infinity
+let parent = getppid()
 while nowUs() < end {
   usleep(50_000)
+  if getppid() != parent { exit(0) }  // the recorder is gone
   let t = nowUs(), gpu = gpuTimes(), machine = machineTicks()
   let wall = (t - prevT) * 1000  // ns, like the GPU times
   func gpuPct(_ pids: [pid_t]) -> Double {

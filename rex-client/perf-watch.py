@@ -20,6 +20,7 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -269,6 +270,7 @@ class Watch:
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gap", type=float, default=50, help="a window frame this many ms or longer is a stutter")
     w = Watch(ap.parse_args().gap)

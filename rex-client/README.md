@@ -16,29 +16,51 @@ BOWSER_LOG=1 rex-client/run.sh server; rex-client/bench-startup.sh   # docs/perf
 
 ## Find a stutter
 
-Run `rex-client/perf-trace.sh 15` while the stutter happens: scroll, play the
-video, or switch to the Rex window's Space. It records four lanes on one
-clock and prints each **spike** (a burst of late or dropped frames) with what
-was busy, what went silent, and the GPU and CPU load meanwhile:
+Three tools, one capture format. Every capture is `dev/perf/<time>/` with a
+`trace.json.gz` (open it in [Perfetto](https://ui.perfetto.dev)) and a report.
+All captures together stay under 200 MB (`PERF_KEEP_MB`); the oldest go first.
+
+| Tool | Use it when |
+|---|---|
+| `perf-watch.py` | You use the browser and want each stutter caught. Leave it running. It saves the 6 s before a Rex window shows a frame of 50 ms or more (`--gap`), or before you press **⌃⌥⌘J** in the dev Rex. |
+| `perf-trace.sh SECS` | You can make it stutter on purpose: record now, for SECS. |
+| `perf-load.py` | Load tests: scripted scenarios in the `loadtest` session (`dev/restore.sh` makes it), one row each. Two scenarios plant a known cause and fail if the report misses it. |
+
+The report shows each lane as a strip, so a stutter lines up across them,
+and each spike with a verdict:
 
 ```
-  1.900s  107 ms: 5× tab 13402: dropped frame, 1× tab 13402: presented frames
-     120.2 ms  Renderer / CrRendererMain: RunTask > … > v8.callFunction (jank) > FunctionCall (jank)
-     load: GPU busy %: Chromium GPU process 21, WindowServer 12, other apps 5, Rex client 0
+  index.html             │▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▃▁▁▁▁▁▁▁▁▁▁▁▁▃▁▁▁▁▁▃▁▁▁▁│
+  Rex main thread busy   │                                  ▁     │
+  GPU busy (all)         │▄▃▃▅▆▄▄▅▄▄▄▄▅▄▄▄▃▄▃▄▅▄▃▃▄▃▄▆▅▄▄▄▅▅▄▆▄▅▄▄│  0–100%
+
+  #1 at   1.74s, 33 ms: 1 late in index.html
+     ⇒ waiting for WindowServer to put the frame on screen: 33 ms, usually 20
+     stage SwapEndToPresentationCompositorFrame: 33.0 ms, usually 20.4: …
+     GPU busy %: Chromium GPU process 16, other apps 5, WindowServer 2
 ```
 
 | Lane | Source | Shows |
 |---|---|---|
-| Chromium | engine `trace_start`/`trace_stop` | Each frame from the page's main thread to the GPU process's commit to WindowServer; dropped frames; script and raster |
-| Rex client | `BOWSER_REX_PERF` (`run.sh` sets it) | Main-thread turns of 4 ms or more, pane layouts, mounts, attaches |
-| Rex window | `framegaps.swift` (ScreenCaptureKit) | Each frame WindowServer composited for the window. Only while it is on the current Space |
+| Chromium | engine `trace_start`/`trace_stop` | Each frame of each tab through its stages, from the page's main thread to WindowServer; dropped frames; the script, layout or raster that ran |
+| Rex client | `BOWSER_REX_PERF` (`run.sh` sets it) | Main-thread turns of 4 ms or more, pane layouts, mounts, attaches, ⌃⌥⌘J |
+| Rex windows | `framegaps.swift` (ScreenCaptureKit) | Each frame WindowServer composited for each Rex window, while it is on the current Space |
 | Load | `sysmon.swift` | GPU busy per process (IOKit) and CPU, every 50 ms. Other apps only as one total |
 
-`dev/perf/<time>/trace.json` opens in [Perfetto](https://ui.perfetto.dev).
-A spike with a slice names its cause. A spike where a process *logged
-nothing* means it was stopped, starved of CPU, or blocked in the kernel.
-A spike only in the Rex window lane is between Chromium and the screen.
+How to read a verdict:
 
+| Verdict starts with | Where the time went |
+|---|---|
+| the page's main thread | The page's own script, style, layout or paint. Any browser pays it. |
+| Chromium's GPU process was busy | Raster or drawing in the engine |
+| a stage name (rasterizing, drawing, waiting for WindowServer) | The stage that grew most against the tab's usual frame |
+| … went silent | That process was stopped, starved of CPU, or blocked in the kernel |
+| GPU saturated | Everything on the Mac wanted the GPU |
+| after Chromium | The page presented on time but the Rex window didn't update: Rex or WindowServer |
+
+Chromium's trace buffer stops recording when full (about 640 MB, 2 minutes
+of one busy tab), so `perf-watch.py` throws it away and restarts it every
+20 s. Tracing costs the engine about 8 % of one core while it runs.
 
 ## How it works
 

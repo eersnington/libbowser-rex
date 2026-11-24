@@ -57,6 +57,9 @@ class Capture:
         self.pname = {e["pid"]: e["args"]["name"] for e in events if e.get("ph") == "M" and e["name"] == "process_name"}
         self.tname = {(e["pid"], e.get("tid")): e["args"]["name"] for e in events
                       if e.get("ph") == "M" and e["name"] == "thread_name"}
+        for (pid, _), name in self.tname.items():
+            if name == "CrBrowserMain" and pid not in self.pname:
+                self.pname[pid] = "Engine browser process"
         timed = [e["ts"] for e in events if e.get("ph") != "M" and e.get("ts", 0) > 0]
         self.t0, self.t1 = min(timed), max(timed)
         self.slices = [e for e in events if e.get("ph") == "X" and e.get("dur", 0) >= BUSY and e.get("cat") != "window"]
@@ -129,11 +132,20 @@ class Capture:
         out = {}
         for pid, tab in frames.items():
             fr = sorted(tab.values(), key=lambda r: r["end"])
-            shown = [r for r in fr if r["fr"].get("state", "").startswith("STATE_PRESENTED")]
-            for prev, r in zip(shown, shown[1:]):
-                f = r["fr"]
-                if f.get("has_main_animation") or f.get("has_compositor_animation") or f.get("scroll_state") not in (None, "SCROLL_NONE"):
-                    r["interval"] = r["end"] - prev["end"]
+            # A frame interval counts only inside an animation: both frames
+            # animate, and no frame between them had nothing to update. So the
+            # pause before an animation starts is not a stutter.
+            prev = None
+            for r in fr:
+                f, state = r["fr"], r["fr"].get("state", "")
+                moving = bool(f.get("has_main_animation") or f.get("has_compositor_animation")
+                              or f.get("scroll_state") not in (None, "SCROLL_NONE"))
+                if state == "STATE_NO_UPDATE_DESIRED" or not moving:
+                    prev = None
+                elif state.startswith("STATE_PRESENTED"):
+                    if prev is not None:
+                        r["interval"] = r["end"] - prev["end"]
+                    prev = r
             typical = {}
             for r in fr:
                 for s, d in r["stages"].items():
@@ -149,9 +161,12 @@ class Capture:
         span = self.t1 - self.t0
         stamps = {p: sorted(t) for p, t in per.items() if len(t) > span / VSYNC}
         usual = {}
-        for p, t in stamps.items():
+        for p, t in list(stamps.items()):
             g = sorted(b - a for a, b in zip(t, t[1:]))
-            usual[p] = g[int(len(g) * 0.99)]
+            if g[int(len(g) * 0.99)] > 2 * VSYNC:
+                del stamps[p]  # logs in bursts: a quiet stretch means nothing
+            else:
+                usual[p] = g[int(len(g) * 0.99)]
         return stamps, usual
 
     # ---- what happened during [start, end] ------------------------------
