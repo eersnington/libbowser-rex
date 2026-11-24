@@ -1,209 +1,364 @@
 #!/usr/bin/env python3
-"""Merge a perf-trace.sh run into one trace, and explain each late frame.
+"""Explain the late frames in one capture from perf-trace.sh or perf-watch.
 
-  perf-report.py DIR
+  perf-report.py CAPTURE_DIR
 
-DIR holds chrome.json (the engine's Chromium trace), client.jsonl (the Rex
-client's lane), load.jsonl (GPU and CPU load) and, when the window was on
-screen, window.jsonl (what WindowServer composited). Every timestamp is µs of mach time. Writes
-DIR/trace.json, for https://ui.perfetto.dev or chrome://tracing, and prints:
+The capture holds trace.json.gz: Chromium's trace from every engine process,
+merged with the Rex client's main thread (pid "Rex client"), what WindowServer
+composited for the Rex window (when it was on screen), and GPU and CPU load.
+All timestamps are µs of mach time. Open the same file in ui.perfetto.dev.
 
-  - per tab: frames presented, dropped, and the gaps between presented frames
-    while the page was animating
-  - every late frame in any lane, with the slices that overlapped it, longest
-    first, by process and thread: what was busy while the frame was late
+Prints, in order: a strip per lane (the worst frame in each time slot, so a
+stutter lines up across lanes), each tab's frame stats, and each spike (a
+burst of late or dropped frames) with a verdict, the pipeline stages that
+took longer than usual, what was busy, what went silent, and the load.
 """
 import bisect
+import gzip
 import json
 import os
+import statistics
 import sys
+from urllib.parse import urlparse
 
 VSYNC = 16_667  # µs at 60 Hz
-LATE = 1.5 * VSYNC  # a gap this long means at least one frame was missed
+LATE = 1.5 * VSYNC  # a frame interval this long missed at least one vsync
 BUSY = 4_000  # overlapping slices shorter than this are noise
+STRIP = 72  # characters per strip
+# Chromium's frame stages (PipelineReporter), in the words a reader needs.
+STAGES = {
+    "BeginImplFrameToSendBeginMainFrame": "the compositor waited to start the page's frame",
+    "SendBeginMainFrameToCommit": "the page's main thread: script, style, layout, paint",
+    "Commit": "handing the page's frame to the compositor",
+    "EndCommitToActivation": "rasterizing tiles before the frame could show",
+    "Activation": "activating the new frame",
+    "EndActivateToSubmitCompositorFrame": "the compositor drawing the frame",
+    "SubmitCompositorFrameToPresentationCompositorFrame": "from the page's frame to the screen",
+    "ReceiveCompositorFrameToStartDraw": "the GPU process waited to draw: busy, or holding for its deadline",
+    "StartDrawToSwapStart": "the GPU process drawing the frame",
+    "SwapStartToSwapEnd": "the GPU process swapping the frame to Core Animation",
+    "SwapStartToBufferAvailable": "waiting for a free buffer (the GPU still used the old ones)",
+    "BufferAvailableToBufferReady": "the GPU finishing the frame",
+    "BufferReadyToLatch": "waiting for the display to take the frame",
+    "LatchToSwapEnd": "the swap after the display took the frame",
+    "SwapEndToPresentationCompositorFrame": "waiting for WindowServer to put the frame on screen",
+}
+STATE_RANK = {"STATE_PRESENTED_ALL": 3, "STATE_PRESENTED_PARTIAL": 2, "STATE_DROPPED": 1}
 
 
-def load_jsonl(path):
-    if not os.path.exists(path):
-        return []
-    with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
+def load(d):
+    with gzip.open(os.path.join(d, "trace.json.gz"), "rt") as f:
+        return json.load(f)["traceEvents"]
 
 
-def main(d):
-    chrome = json.load(open(os.path.join(d, "chrome.json")))["traceEvents"]
-    client = load_jsonl(os.path.join(d, "client.jsonl"))
-    window = load_jsonl(os.path.join(d, "window.jsonl"))
-    load = load_jsonl(os.path.join(d, "load.jsonl"))
-    events = chrome + client + window + load
-    counters = {}
-    for e in load:
-        if e.get("ph") == "C":
-            counters.setdefault(e["name"], []).append((e["ts"], e["args"]))
+class Capture:
+    def __init__(self, events):
+        self.events = events
+        self.pname = {e["pid"]: e["args"]["name"] for e in events if e.get("ph") == "M" and e["name"] == "process_name"}
+        self.tname = {(e["pid"], e.get("tid")): e["args"]["name"] for e in events
+                      if e.get("ph") == "M" and e["name"] == "thread_name"}
+        timed = [e["ts"] for e in events if e.get("ph") != "M" and e.get("ts", 0) > 0]
+        self.t0, self.t1 = min(timed), max(timed)
+        self.slices = [e for e in events if e.get("ph") == "X" and e.get("dur", 0) >= BUSY and e.get("cat") != "window"]
+        self.by_thread = {}
+        for e in self.slices:
+            self.by_thread.setdefault((e["pid"], e.get("tid")), []).append(e)
+        self.counters = {}
+        sampler = {p for p, n in self.pname.items() if n.startswith("Mac load")}
+        for e in events:
+            if e.get("ph") == "C" and e["pid"] in sampler:
+                self.counters.setdefault(e["name"], []).append((e["ts"], e["args"]))
+        self.urls = self.tab_urls()
+        self.tabs = self.tab_frames()
+        self.stamps, self.usual_gap = self.heartbeats()
 
-    def load_during(start, end):
-        # Mean of each counter over the samples that overlap [start, end].
-        out = []
-        for name, samples in counters.items():
-            hit = [a for (ts, a), (nxt, _) in zip(samples, samples[1:] + [(float("inf"), None)]) if ts < end and nxt > start]
-            if hit:
-                mean = {k: sum(a[k] for a in hit) / len(hit) for k in hit[0]}
-                out.append(name + ": " + ", ".join(f"{k} {v:.0f}" for k, v in sorted(mean.items(), key=lambda kv: -kv[1])))
+    # ---- who is who ----------------------------------------------------
+
+    def tab_urls(self):
+        # CEF's trace has no page-to-process record, but script slices carry
+        # their script's URL: name each renderer after its most common one.
+        seen = {}
+        for e in self.events:
+            data = e.get("args", {}).get("data") if isinstance(e.get("args"), dict) else None
+            if isinstance(data, dict) and isinstance(data.get("url"), str) and data["url"]:
+                per = seen.setdefault(e["pid"], {})
+                per[data["url"]] = per.get(data["url"], 0) + 1
+        return {pid: max(c, key=c.get) for pid, c in seen.items()}
+
+    def tab_name(self, pid):
+        url = self.urls.get(pid, "")
+        if url.startswith("data:"):
+            return "data: page"
+        if url.startswith("file:"):
+            return os.path.basename(urlparse(url).path) or url
+        return urlparse(url).netloc or url or f"renderer {pid}"
+
+    def where(self, e):
+        return f"{self.pname.get(e['pid'], e['pid'])} / {self.tname.get((e['pid'], e.get('tid')), e.get('tid'))}"
+
+    def at(self, ts):
+        return f"{(ts - self.t0) / 1e6:6.2f}s"
+
+    # ---- frames ----------------------------------------------------------
+
+    def tab_frames(self):
+        """Per renderer: one record per frame, with its stages."""
+        open_, frames = {}, {}
+        for e in self.events:
+            if e.get("ph") not in ("b", "e") or "id2" not in e and "id" not in e:
+                continue
+            key = (e["pid"], json.dumps(e.get("id2") or e.get("id")))
+            if e["name"] == "PipelineReporter":
+                if e["ph"] == "b":
+                    open_[key] = {"fr": e["args"].get("frame_reporter", {}), "start": e["ts"], "stages": {}, "open": {}}
+                elif key in open_:
+                    r = open_.pop(key)
+                    r["end"] = e["ts"]
+                    fr = r["fr"]
+                    seq = (fr.get("layer_tree_host_id"), fr.get("frame_sequence"))
+                    tab = frames.setdefault(e["pid"], {})
+                    old = tab.get(seq)
+                    if not old or (STATE_RANK.get(fr.get("state"), 0), r["end"]) > (STATE_RANK.get(old["fr"].get("state"), 0), old["end"]):
+                        tab[seq] = r
+            elif key in open_:
+                r = open_[key]
+                if e["ph"] == "b":
+                    r["open"][e["name"]] = e["ts"]
+                elif e["name"] in r["open"]:
+                    r["stages"][e["name"]] = r["stages"].get(e["name"], 0) + e["ts"] - r["open"].pop(e["name"])
+        out = {}
+        for pid, tab in frames.items():
+            fr = sorted(tab.values(), key=lambda r: r["end"])
+            shown = [r for r in fr if r["fr"].get("state", "").startswith("STATE_PRESENTED")]
+            for prev, r in zip(shown, shown[1:]):
+                f = r["fr"]
+                if f.get("has_main_animation") or f.get("has_compositor_animation") or f.get("scroll_state") not in (None, "SCROLL_NONE"):
+                    r["interval"] = r["end"] - prev["end"]
+            typical = {}
+            for r in fr:
+                for s, d in r["stages"].items():
+                    typical.setdefault(s, []).append(d)
+            out[pid] = {"frames": fr, "typical": {s: statistics.median(v) for s, v in typical.items()}}
         return out
-    json.dump({"traceEvents": events}, open(os.path.join(d, "trace.json"), "w"))
 
-    pname = {e["pid"]: e["args"]["name"] for e in events if e.get("ph") == "M" and e["name"] == "process_name"}
-    tname = {(e["pid"], e["tid"]): e["args"]["name"] for e in events if e.get("ph") == "M" and e["name"] == "thread_name"}
-    labels = {e["pid"]: e["args"].get("labels") for e in events if e.get("ph") == "M" and e["name"] == "process_labels"}
-    t0 = min(e["ts"] for e in events if "ts" in e and e.get("ph") != "M")
+    def heartbeats(self):
+        per = {}
+        for e in self.events:
+            if e.get("ph") not in ("M", "C") and e.get("ts", 0) > 0 and e.get("cat") not in ("rex", "window"):
+                per.setdefault(e["pid"], []).append(e["ts"])
+        span = self.t1 - self.t0
+        stamps = {p: sorted(t) for p, t in per.items() if len(t) > span / VSYNC}
+        usual = {}
+        for p, t in stamps.items():
+            g = sorted(b - a for a, b in zip(t, t[1:]))
+            usual[p] = g[int(len(g) * 0.99)]
+        return stamps, usual
 
-    def where(e):
-        p = pname.get(e["pid"], str(e["pid"]))
-        if labels.get(e["pid"]):
-            p += f" ({labels[e['pid']]})"
-        return f"{p} / {tname.get((e['pid'], e.get('tid')), e.get('tid'))}"
+    # ---- what happened during [start, end] ------------------------------
 
-    def at(ts):
-        return f"{(ts - t0) / 1e6:7.3f}s"
-
-    slices = [e for e in events if e.get("ph") == "X" and e.get("dur", 0) >= BUSY and e.get("cat") != "window"]
-
-    by_thread = {}
-    for e in slices:
-        by_thread.setdefault((e["pid"], e.get("tid")), []).append(e)
-
-    def chain(top):
-        # The slices nested in `top` that take most of it: what it was doing.
+    def chain(self, top):
         names, cur = [top["name"]], top
-        inner = by_thread[(top["pid"], top.get("tid"))]
+        inner = self.by_thread[(top["pid"], top.get("tid"))]
         while len(names) < 9:
             kids = [e for e in inner if e is not cur and e["ts"] >= cur["ts"] and e["ts"] + e["dur"] <= cur["ts"] + cur["dur"]
-                    and e["dur"] >= cur["dur"] * 0.5 and e["dur"] < cur["dur"] + 1]
-            kids = [k for k in kids if k["dur"] < cur["dur"] or k["ts"] > cur["ts"]]
+                    and e["dur"] >= cur["dur"] * 0.5 and (e["dur"] < cur["dur"] or e["ts"] > cur["ts"])]
             if not kids:
                 break
             cur = max(kids, key=lambda e: e["dur"])
-            arg = cur.get("args", {}).get("data", {})
-            names.append(cur["name"] + (f" ({arg.get('functionName') or arg.get('url') or ''})".replace(" ()", "")
-                                        if isinstance(arg, dict) else ""))
-        # Skip the generic task wrappers; keep where it ended up.
+            data = cur.get("args", {}).get("data", {}) if isinstance(cur.get("args"), dict) else {}
+            extra = (data.get("functionName") or data.get("url") or "") if isinstance(data, dict) else ""
+            names.append(cur["name"] + (f" ({extra[:60]})" if extra else ""))
         return " > ".join(names if len(names) <= 4 else [names[0], "…"] + names[-3:])
 
-    def busy(start, end):
-        hits = [e for e in slices if e["ts"] < end and e["ts"] + e["dur"] > start]
-        # Keep the outermost slice per thread: nested ones repeat it.
-        hits.sort(key=lambda e: (-e["dur"], e["ts"]))
+    def busy(self, start, end):
+        hits = sorted((e for e in self.slices if e["ts"] < end and e["ts"] + e["dur"] > start), key=lambda e: (-e["dur"], e["ts"]))
         out, seen = [], set()
         for e in hits:
-            key = (e["pid"], e.get("tid"))
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(f"      {e['dur'] / 1000:6.1f} ms  {where(e)}: {chain(e)}")
-        out = out[:6]
-        # A process that logs every frame but went quiet was stopped, starved
-        # of CPU, or blocked in the kernel: its slices can't show that.
-        for pid, ts in stamps.items():
+            k = (e["pid"], e.get("tid"))
+            if k not in seen:
+                seen.add(k)
+                out.append(e)
+        return out[:5]
+
+    def silent(self, start, end):
+        out = []
+        for pid, ts in self.stamps.items():
             i, j = bisect.bisect_left(ts, start), bisect.bisect_right(ts, end)
-            window = ts[max(i - 1, 0):j + 1]
-            gap = max((b - a for a, b in zip(window, window[1:])), default=0)
-            if gap >= max(LATE, 4 * usual_gap[pid]):
-                out.append(f"      {gap / 1000:6.1f} ms  {pname.get(pid, pid)} logged nothing "
-                           "(stopped, starved of CPU, or blocked in the kernel)")
-        return out or ["      (nothing busy and nothing silent in the trace: look outside the engine and Rex)"]
+            w = ts[max(i - 1, 0):j + 1]
+            gap = max((b - a for a, b in zip(w, w[1:])), default=0)
+            if gap >= max(LATE, 4 * self.usual_gap[pid]):
+                out.append((pid, gap))
+        return out
 
-    # Event times per process that logs at least once a frame, for `busy`.
-    per_pid = {}
-    for e in chrome:
-        if "ts" in e and e.get("ph") != "M":
-            per_pid.setdefault(e["pid"], []).append(e["ts"])
-    span = max(e["ts"] for e in events if "ts" in e) - t0
-    stamps = {pid: sorted(ts) for pid, ts in per_pid.items() if len(ts) > span / VSYNC}
-    usual_gap = {}
-    for pid, ts in stamps.items():
-        g = sorted(b - a for a, b in zip(ts, ts[1:]))
-        usual_gap[pid] = g[int(len(g) * 0.99)]
+    def load(self, start, end):
+        out = {}
+        for name, samples in self.counters.items():
+            hit = [a for (ts, a), (nxt, _) in zip(samples, samples[1:] + [(float("inf"), None)]) if ts < end and nxt > start]
+            if hit:
+                out[name] = {k: sum(a[k] for a in hit) / len(hit) for k in hit[0]}
+        return out
 
-    late = []  # (lane, start, end)
+    # ---- spikes -----------------------------------------------------------
 
-    # Tabs: one PipelineReporter per renderer frame, ending at presentation.
-    tabs = {}
-    for e in chrome:
-        if e.get("name") != "PipelineReporter":
-            continue
-        tab = tabs.setdefault(e["pid"], {"begin": {}, "frames": []})
-        key = json.dumps(e.get("id2") or e.get("id"))
-        if e["ph"] == "b":
-            tab["begin"][key] = e
-        elif e["ph"] == "e" and key in tab["begin"]:
-            b = tab["begin"].pop(key)
-            tab["frames"].append((b["args"]["frame_reporter"], b["ts"], e["ts"]))
-    print("Tabs (one renderer each):")
-    for pid, tab in tabs.items():
-        frames = sorted(tab["frames"], key=lambda f: f[2])
-        states = {}
-        for fr, _, _ in frames:
-            states[fr.get("state")] = states.get(fr.get("state"), 0) + 1
-        shown = [(fr, end) for fr, _, end in frames if fr.get("state", "").startswith("STATE_PRESENTED")]
-        animating = [
-            (a, b) for (fa, a), (fb, b) in zip(shown, shown[1:])
-            if fb.get("has_main_animation") or fb.get("has_compositor_animation") or fb.get("scroll_state") != "SCROLL_NONE"
-        ]
-        gaps = sorted(b - a for a, b in animating)
-        name = where({"pid": pid, "tid": None}).split(" / ")[0]
-        print(f"  {name} pid {pid}: {len(frames)} frames {states}")
-        if gaps:
-            p99 = gaps[min(len(gaps) - 1, int(len(gaps) * 0.99))]
-            print(f"    presented while animating: p50 {gaps[len(gaps) // 2] / 1000:.1f} ms, p99 {p99 / 1000:.1f} ms, "
-                  f"max {gaps[-1] / 1000:.1f} ms, late {sum(g > LATE for g in gaps)}")
-        for a, b in animating:
-            if b - a > LATE:
-                late.append((f"tab {pid}: presented frames", a, b))
-        for fr, start, end in frames:
-            if fr.get("state") == "STATE_DROPPED":
-                late.append((f"tab {pid}: dropped frame", start, end))
+    def late_frames(self):
+        late = []
+        for pid, tab in self.tabs.items():
+            for r in tab["frames"]:
+                if r["fr"].get("state") == "STATE_DROPPED":
+                    late.append(("tab", pid, r["start"], r["end"], r, "dropped"))
+                elif r.get("interval", 0) > LATE:
+                    late.append(("tab", pid, r["end"] - r["interval"], r["end"], r, "late"))
+        for e in self.events:
+            if e.get("cat") == "window" and e.get("ph") == "X" and e["dur"] > LATE:
+                late.append(("window", None, e["ts"], e["ts"] + e["dur"], None, "late"))
+        return sorted(late, key=lambda x: x[2])
 
-    # The GPU process hands each frame to Core Animation here.
-    commits = sorted(e["ts"] for e in chrome if e.get("name") == "CommitPresentedFrameToCA")
-    if len(commits) > 1:
-        g = sorted(b - a for a, b in zip(commits, commits[1:]))
-        print(f"GPU → WindowServer commits: {len(commits)}, p50 {g[len(g) // 2] / 1000:.1f} ms, max {g[-1] / 1000:.1f} ms")
+    def spikes(self):
+        out = []
+        for lane, pid, start, end, r, kind in self.late_frames():
+            if out and start <= out[-1]["end"] + 2 * VSYNC:
+                sp = out[-1]
+                sp["end"] = max(sp["end"], end)
+            else:
+                sp = {"start": start, "end": end, "frames": []}
+                out.append(sp)
+            sp["frames"].append((lane, pid, r, kind))
+        return out
 
-    shown = sorted((e["ts"], e["dur"]) for e in window if e.get("name") == "frame")
-    if shown:
-        g = sorted(d for _, d in shown)
-        print(f"Rex window on screen: {len(g)} frames, p50 {g[len(g) // 2] / 1000:.1f} ms, max {g[-1] / 1000:.1f} ms, "
-              f"late {sum(x > LATE for x in g)}")
-        late += [("Rex window on screen", ts, ts + d) for ts, d in shown if d > LATE]
-    else:
-        print("Rex window on screen: not measured (window was off screen)")
+    def stage_cause(self, sp):
+        """The innermost stage that grew the most, as a cause."""
+        grown = self.grown_stages(sp)
+        inner = [g for g in grown if g[0][1] != "SubmitCompositorFrameToPresentationCompositorFrame"]
+        if not (inner or grown):
+            return None
+        (pid, s), (extra, took, typ) = (inner or grown)[0]
+        return f"{STAGES.get(s, s)}: {took / 1000:.0f} ms, usually {typ / 1000:.0f}"
 
-    for line in load_during(t0, float("inf")):
-        print(f"Load over the whole trace: {line}")
-    stalls = [e for e in client if e.get("name") == "main thread busy"]
-    if stalls:
-        print(f"Rex main thread: {len(stalls)} turns of 4 ms or more, longest {max(e['dur'] for e in stalls) / 1000:.1f} ms")
+    def grown_stages(self, sp):
+        """Stages of the spike's frames that took longer than the tab's usual."""
+        grown = {}
+        for lane, pid, r, _ in sp["frames"]:
+            if not r:
+                continue
+            typical = self.tabs[pid]["typical"]
+            for s, d in r["stages"].items():
+                extra = d - typical.get(s, 0)
+                if extra > 8_000 and extra > grown.get((pid, s), (0, 0))[0]:
+                    grown[(pid, s)] = (extra, d, typical.get(s, 0))
+        return sorted(grown.items(), key=lambda kv: -kv[1][0])[:4]
 
-    # One spike per burst: late frames that touch or sit within two vsyncs.
-    late.sort(key=lambda x: x[1])
-    spikes = []
-    for lane, start, end in late:
-        if spikes and start <= spikes[-1]["end"] + 2 * VSYNC:
-            sp = spikes[-1]
-            sp["end"] = max(sp["end"], end)
-            sp["lanes"][lane] = sp["lanes"].get(lane, 0) + 1
-        else:
-            spikes.append({"start": start, "end": end, "lanes": {lane: 1}})
-    print(f"\nSpikes: {len(spikes)} ({len(late)} late or dropped frames)")
-    for sp in spikes[:25]:
-        lanes = ", ".join(f"{n}× {lane}" for lane, n in sp["lanes"].items())
-        print(f"  {at(sp['start'])}  {(sp['end'] - sp['start']) / 1000:.0f} ms: {lanes}")
-        print("\n".join(busy(sp["start"], sp["end"])))
-        for line in load_during(sp["start"], sp["end"]):
-            print(f"      load: {line}")
-    if len(spikes) > 25:
-        print(f"  … {len(spikes) - 25} more in trace.json")
-    print(f"\nOpen {os.path.join(d, 'trace.json')} in https://ui.perfetto.dev")
+    def verdict(self, sp, busy, silent, load):
+        lanes = {f[0] for f in sp["frames"]}
+        gpu = load.get("GPU busy %", {})
+        cpu = load.get("CPU %", {})
+        if silent:
+            pid, gap = max(silent, key=lambda s: s[1])
+            mac = cpu.get("whole Mac, % of all cores", 0)
+            why = "the Mac's CPUs were saturated" if mac > 85 else "stopped, or blocked in the kernel"
+            return f"{self.pname.get(pid, pid)} went silent for {gap / 1000:.0f} ms ({why})"
+        if gpu and sum(gpu.values()) > 90:
+            top = max(gpu.items(), key=lambda kv: kv[1])
+            return f"GPU saturated ({sum(gpu.values()):.0f}%, most from {top[0]})"
+        if lanes == {"window"}:
+            rex = [e for e in busy if self.pname.get(e["pid"]) == "Rex client"]
+            if rex:
+                return f"after Chromium: Rex's main thread was busy {rex[0]['dur'] / 1000:.0f} ms"
+            return "after Chromium: the page presented on time, but the Rex window didn't update (WindowServer or Rex)"
+        stage = self.stage_cause(sp)
+        if stage and (not busy or busy[0]["dur"] < 0.5 * (sp["end"] - sp["start"])):
+            return stage
+        if busy:
+            e = busy[0]
+            who = self.where(e)
+            if "Renderer" in who and "CrRendererMain" in who:
+                return f"the page's main thread ({self.chain(e).split(' > ')[-1]}) ran {e['dur'] / 1000:.0f} ms"
+            if "GPU Process" in who:
+                return f"Chromium's GPU process was busy {e['dur'] / 1000:.0f} ms ({self.chain(e).split(' > ')[-1]})"
+            return f"{who} was busy {e['dur'] / 1000:.0f} ms"
+        return "no single cause in the trace: several small costs added up, or the wait was outside these processes"
+
+    # ---- strips ------------------------------------------------------------
+
+    def strip(self, points):
+        """points: (ts, value_ms). The worst value in each slot as a block."""
+        slots = [0.0] * STRIP
+        width = (self.t1 - self.t0) / STRIP or 1
+        for ts, v in points:
+            i = min(STRIP - 1, max(0, int((ts - self.t0) / width)))
+            slots[i] = max(slots[i], v)
+        blocks = " ▁▂▃▄▅▆▇█"
+        def block(v):
+            if v <= 0:
+                return " "
+            if v <= 18:
+                return "▁"
+            return blocks[min(8, 2 + int((v - 18) / 12))]
+        return "".join(block(v) for v in slots)
+
+    def counter_strip(self, name, key=None):
+        pts = []
+        for ts, a in self.counters.get(name, []):
+            v = sum(a.values()) if key is None else a.get(key, 0)
+            pts.append((ts, 18 + v * 0.82))  # 0..100% onto the same blocks
+        return self.strip(pts)
+
+
+def main(d):
+    c = Capture(load(d))
+    span = (c.t1 - c.t0) / 1e6
+    window_frames = [(e["ts"] + e["dur"], e["dur"] / 1000) for e in c.events if e.get("cat") == "window" and e.get("ph") == "X"]
+    print(f"Capture {os.path.basename(d.rstrip('/'))}: {span:.1f} s, {len(c.tabs)} tab(s), "
+          f"Rex window {'on screen' if window_frames else 'off screen (no WindowServer lane)'}")
+    print(f"\nWorst frame per {span / STRIP * 1000:.0f} ms   ▁ on time   ▃ 1 missed   ▅ 2–3 missed   █ ≥100 ms")
+    for pid, tab in c.tabs.items():
+        pts = [(r["end"], r.get("interval", 0) / 1000) for r in tab["frames"]]
+        pts += [(r["end"], 100) for r in tab["frames"] if r["fr"].get("state") == "STATE_DROPPED"]
+        print(f"  {c.tab_name(pid)[:22]:22s} │{c.strip(pts)}│")
+    if window_frames:
+        print(f"  {'Rex window on screen':22s} │{c.strip(window_frames)}│")
+    rex = [(e["ts"] + e["dur"], e["dur"] / 1000) for e in c.events if e.get("cat") == "rex" and e.get("ph") == "X"]
+    print(f"  {'Rex main thread busy':22s} │{c.strip(rex)}│")
+    if "GPU busy %" in c.counters:
+        print(f"  {'GPU busy (all)':22s} │{c.counter_strip('GPU busy %')}│  0–100%")
+        print(f"  {'CPU (whole Mac)':22s} │{c.counter_strip('CPU %', 'whole Mac, % of all cores')}│  0–100%")
+    ticks = "".join("┬" if i % 12 == 0 else "─" for i in range(STRIP))
+    print(f"  {'':22s} └{ticks}┘")
+    print(f"  {'':22s}  " + "".join(f"{span * i / STRIP:<12.1f}"[:12] for i in range(0, STRIP, 12)) + "s")
+
+    print("\nTabs")
+    for pid, tab in c.tabs.items():
+        fr = tab["frames"]
+        dropped = sum(r["fr"].get("state") == "STATE_DROPPED" for r in fr)
+        iv = sorted(r["interval"] for r in fr if "interval" in r)
+        line = f"  {c.tab_name(pid)}: {len(fr)} frames, {dropped} dropped"
+        if iv:
+            worst = iv[int(len(iv) * 0.99):]
+            line += (f", while animating p50 {iv[len(iv) // 2] / 1000:.1f} ms, p99 {iv[int(len(iv) * 0.99)] / 1000:.1f} ms, "
+                     f"1% low {1e6 / statistics.mean(worst):.0f} fps, {sum(i > LATE for i in iv)} late")
+        print(line)
+
+    spikes = c.spikes()
+    print(f"\nSpikes: {len(spikes)}")
+    for n, sp in enumerate(spikes[:15], 1):
+        busy, silent, load_ = c.busy(sp["start"], sp["end"]), c.silent(sp["start"], sp["end"]), c.load(sp["start"], sp["end"])
+        what = {}
+        for lane, pid, _, kind in sp["frames"]:
+            k = f"{kind} in {'the Rex window' if lane == 'window' else c.tab_name(pid)}"
+            what[k] = what.get(k, 0) + 1
+        print(f"\n  #{n} at {c.at(sp['start'])}, {(sp['end'] - sp['start']) / 1000:.0f} ms: "
+              + ", ".join(f"{v} {k}" for k, v in what.items()))
+        print(f"     ⇒ {c.verdict(sp, busy, silent, load_)}")
+        for (pid, s), (extra, took, typ) in c.grown_stages(sp):
+            print(f"     stage {s}: {took / 1000:.1f} ms, usually {typ / 1000:.1f}: {STAGES.get(s, '')}")
+        for e in busy:
+            print(f"     busy {e['dur'] / 1000:5.1f} ms  {c.where(e)}: {c.chain(e)}")
+        for pid, gap in silent:
+            print(f"     silent {gap / 1000:5.1f} ms  {c.pname.get(pid, pid)}")
+        for name, vals in load_.items():
+            print(f"     {name}: " + ", ".join(f"{k} {v:.0f}" for k, v in sorted(vals.items(), key=lambda kv: -kv[1]) if v >= 1))
+    if len(spikes) > 15:
+        print(f"\n  … {len(spikes) - 15} more; open the trace in ui.perfetto.dev")
+    print(f"\nTimeline: {os.path.join(d, 'trace.json.gz')} → https://ui.perfetto.dev")
 
 
 if __name__ == "__main__":

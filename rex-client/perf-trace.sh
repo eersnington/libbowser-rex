@@ -14,7 +14,7 @@
 #   window.jsonl  each frame WindowServer composited for the Rex window, if
 #                 it is on screen (framegaps)
 #   load.jsonl    GPU busy per process and CPU, every 50 ms (sysmon)
-# Writes rex-client/dev/perf/<time>/ with trace.json for ui.perfetto.dev.
+# Writes rex-client/dev/perf/<time>/trace.json.gz, also for ui.perfetto.dev.
 set -eu
 here="$(cd "$(dirname "$0")" && pwd)"
 dev="$here/dev"
@@ -55,7 +55,7 @@ perl -e "select(undef,undef,undef,$secs)"
 [ -n "${gaps:-}" ] && wait "$gaps" || true
 wait "$load" || true
 
-# The client's lane: its metadata, and its events during the trace.
+# The client's lane: its names, and its events during the trace.
 python3 - "$dev/perf.jsonl" "$out/client.jsonl" "$start" << 'EOF'
 import json, sys
 src, dst, start = sys.argv[1], sys.argv[2], float(sys.argv[3])
@@ -67,7 +67,10 @@ with open(src) as f, open(dst, "w") as o:
 EOF
 
 i=0
-while [ ! -f "$out/chrome.json" ] && [ $i -lt 100 ]; do perl -e 'select(undef,undef,undef,0.2)'; i=$((i + 1)); done
+while [ ! -f "$out/chrome.json" ] && [ $i -lt 150 ]; do perl -e 'select(undef,undef,undef,0.2)'; i=$((i + 1)); done
 [ -f "$out/chrome.json" ] || { echo "the engine wrote no trace" >&2; exit 1; }
 cat "$out/window.txt" 2> /dev/null || true
+rm -f "$out/window.txt" "$out/clock.json"
+python3 "$here/perf-capture.py" "$out"
+"$here/perf-prune.sh"
 python3 "$here/perf-report.py" "$out"
