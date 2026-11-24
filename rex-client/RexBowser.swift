@@ -206,6 +206,7 @@ final class BowserPaneView: NSView, NSTextInputClient {
   init(blockID: String) {
     self.blockID = blockID
     super.init(frame: .zero)
+    PaneRects.views.add(self)
     wantsLayer = true
     addTrackingArea(NSTrackingArea(
       rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
@@ -225,6 +226,7 @@ final class BowserPaneView: NSView, NSTextInputClient {
 
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
+    PaneRects.changed()
     NotificationCenter.default.removeObserver(self, name: NSWindow.didChangeScreenNotification, object: nil)
     if let window {
       NotificationCenter.default.addObserver(
@@ -325,6 +327,7 @@ final class BowserPaneView: NSView, NSTextInputClient {
   override func layout() {
     super.layout()
     layoutChrome()
+    PaneRects.changed()
     guard let host else { return }
     let size = bowser_size_s(width: bounds.width, height: bounds.height, scale: Double(window?.backingScaleFactor ?? 2))
     // Rex lays panes out often; only a real change reaches the engine, where a
@@ -729,6 +732,7 @@ public func rexBowserInstall() {
       unsafeBitCast(originalLayout, to: Fn.self)(pane, sel)
     }
     reconcilePane(pane)
+    PaneRects.changed()  // a pane that just mounted, or moved without resizing
     Perf.slice("pane layout", from: start, over: 1000)
   }
   let imp = imp_implementationWithBlock(block)
@@ -807,6 +811,33 @@ enum Perf {
   static func instant(_ name: String) {
     guard file != nil else { return }
     write(["name": name, "cat": "rex", "ph": "i", "s": "t", "ts": now()])
+  }
+}
+
+/// BOWSER_REX_PANES=<file>: where each browser pane sits in its window, as
+/// {"<window number>": {"size": [w, h], "<block id>": [x, y, w, h]}} in points
+/// from the window's top left. framegaps reads it to time each pane's pixels.
+enum PaneRects {
+  static let views = NSHashTable<BowserPaneView>.weakObjects()
+  static let path = ProcessInfo.processInfo.environment["BOWSER_REX_PANES"]
+  static var last = ""
+
+  static func changed() {
+    guard let path else { return }
+    var out: [String: [String: [Double]]] = [:]
+    for v in views.allObjects {
+      guard let w = v.window, v.superview != nil, !v.isHiddenOrHasHiddenAncestor else { continue }
+      let r = v.convert(v.bounds, to: nil)  // window coordinates, origin bottom left
+      let h = w.frame.height
+      var entry = out[String(w.windowNumber)] ?? ["size": [w.frame.width, h]]
+      entry[v.blockID] = [r.minX, h - r.maxY, r.width, r.height]
+      out[String(w.windowNumber)] = entry
+    }
+    guard let data = try? JSONSerialization.data(withJSONObject: out, options: .sortedKeys),
+      let text = String(data: data, encoding: .utf8), text != last
+    else { return }
+    last = text
+    try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
   }
 }
 

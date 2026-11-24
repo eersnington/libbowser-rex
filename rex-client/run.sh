@@ -80,7 +80,7 @@ client)
   REX_SERVER="unix://$dev/s.sock" BOWSER_REX_CLI="$(command -v rex)" BOWSER_REX_SOCKET="$dev/s.sock" BOWSER_SPACE="$space" \
     BOWSER_REX_TICKETS="$dev/tickets.sock" \
     BOWSER_REX_TRACE="$dev/trace.log" BOWSER_REX_DUMP="$dev/views.txt" BOWSER_REX_KEYS="$dev/keys.txt" \
-    BOWSER_REX_PERF="$dev/perf.jsonl" \
+    BOWSER_REX_PERF="$dev/perf.jsonl" BOWSER_REX_PANES="$dev/panes.json" \
     DYLD_INSERT_LIBRARIES="$dev/rexinject.dylib" \
     "$dev/launch" "$here/sandbox.sb" "$app/Contents/MacOS/Rex" < /dev/null > "$dev/client.log" 2>&1 &
   pid=$!

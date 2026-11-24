@@ -38,7 +38,7 @@ def page(title, body):
 
 
 ANIM = page("anim", "<div id=b style='width:80px;height:80px;background:#8c4;will-change:transform'></div>"
-            "<script>function f(t){b.style.transform='translate('+(t/3%600)+'px,'+(t/7%300)+'px)';"
+            "<script>function f(t){b.style.transform='translate('+(t/3%Math.max(1,innerWidth-80))+'px,'+(t/7%Math.max(1,innerHeight-80))+'px)';"
             "requestAnimationFrame(f)}requestAnimationFrame(f)</script>")
 CANVAS = page("canvas", "<canvas id=c style='width:100vw;height:100vh'></canvas><script>"
               "const g=c.getContext('2d');function f(t){c.width=innerWidth*devicePixelRatio;c.height=innerHeight*devicePixelRatio;"
@@ -49,7 +49,7 @@ SCROLL = page("scroll", "<div id=d></div><script>"
               "+'lorem ipsum dolor sit amet '.repeat(12)+'</p><div style=\"height:60px;background:hsl('+i*9%360+' 60% 80%)\"></div>').join('');"
               "let down=true;setInterval(()=>{scrollTo({top:down?document.body.scrollHeight:0,behavior:'smooth'});down=!down},2500)</script>")
 JANK = page("jank", "<div id=b style='width:80px;height:80px;background:#c84;will-change:transform'></div><script>"
-            "function f(t){b.style.transform='translateX('+(t/3%600)+'px)';requestAnimationFrame(f)}requestAnimationFrame(f);"
+            "function f(t){b.style.transform='translateX('+(t/3%Math.max(1,innerWidth-80))+'px)';requestAnimationFrame(f)}requestAnimationFrame(f);"
             "setInterval(function plantedJank(){const e=performance.now()+120;while(performance.now()<e);},2000)</script>")
 
 
@@ -127,11 +127,22 @@ def summarize(d):
         v = re.sub(r"\d+ ms", "N ms", v)
         verdicts[v] = verdicts.get(v, 0) + 1
     load = c.load(c.t0, c.t1)
-    wf = sorted(e["dur"] for e in c.events if e.get("cat") == "window" and e.get("ph") == "X")
+    # On screen: each pane's own frames, from its pixels, while it animates.
     window = None
-    if len(wf) > 20:
-        worst = wf[int(len(wf) * 0.99):]
-        window = {"low": 1e6 / (sum(worst) / len(worst)), "late": sum(d > report.LATE for d in wf)}
+    for key, frames in c.screen().items():
+        if key[0] != "pane":
+            continue
+        durs = [d for _, d in frames]
+        iv = sorted(d for i, d in enumerate(durs) if report.animating(durs, i))
+        if len(iv) < 20:
+            continue
+        worst = iv[int(len(iv) * 0.99):]
+        pane = {"low": 1e6 / (sum(worst) / len(worst)), "late": sum(d > report.LATE for d in iv),
+                "name": f"{c.screen_name(key)} #{key[2]}"}
+        window = window or {"low": pane["low"], "late": 0, "panes": {}}
+        window["low"] = min(window["low"], pane["low"])
+        window["late"] += pane["late"]
+        window["panes"][pane["name"]] = pane["late"]
     return rows, verdicts, load, window, len(c.spikes())
 
 
@@ -169,8 +180,13 @@ SCENARIOS = [
     ("4 panes, heavy canvas, OSR", [CANVAS] * 4, None, None, "osr"),
     ("smooth scrolling", [SCROLL], None, None),
     ("pane open/close beside", [ANIM], "churn", None),
-    ("check: planted page jank", [JANK], None, lambda v: any("plantedJank" in k for k in v)),
-    ("check: GPU process stopped", [ANIM], "gpu", lambda v: any("GPU Process went silent" in k for k in v)),
+    ("check: planted page jank", [JANK], None, lambda v, w: any("plantedJank" in k for k in v)),
+    ("check: GPU process stopped", [ANIM], "gpu", lambda v, w: any("GPU Process went silent" in k for k in v)),
+    # Two panes, one janky: the window keeps changing (the other pane), so
+    # only the per-pane lane can show which one stuttered.
+    ("check: one janky pane on screen", [ANIM, JANK], None,
+     lambda v, w: None if not w else (any(n.startswith("pane jank") and late > 0 for n, late in w["panes"].items())
+                                       and all(late == 0 for n, late in w["panes"].items() if n.startswith("pane anim")))),
 ]
 
 
@@ -198,11 +214,14 @@ def main():
         worst = min(rows, key=lambda r: r["low"])
         print(f"{name:28s} {worst['tab'][:12]:12s} {worst['fps']:5.1f} {worst['p99']:6.1f} {worst['low']:6.0f} "
               f"{sum(r['late'] for r in rows):5d} {sum(r['dropped'] for r in rows):5d}  {gpu:5.0f} {cpu:5.0f}  "
-              + (f"1% low {window['low']:.0f}, {window['late']} late" if window else "off screen"))
+              + (f"worst pane 1% low {window['low']:.0f}, {window['late']} late" if window else "off screen"))
         for v, n in sorted(verdicts.items(), key=lambda kv: -kv[1])[:3]:
             print(f"{'':28s}   {n}× {v}")
         if check:
-            ok = check(verdicts)
+            ok = check(verdicts, window)
+            if ok is None:
+                print(f"{'':28s}   skipped: needs the Rex window on screen")
+                continue
             failed |= not ok
             print(f"{'':28s}   {'ok' if ok else 'FAIL'}: the report names the planted cause")
         if not a.keep:

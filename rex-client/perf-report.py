@@ -25,6 +25,16 @@ VSYNC = 16_667  # µs at 60 Hz
 LATE = 1.5 * VSYNC  # a frame interval this long missed at least one vsync
 BUSY = 4_000  # overlapping slices shorter than this are noise
 STRIP = 72  # characters per strip
+STEADY = 100_000  # frame intervals under this are an animation running
+
+
+def animating(durs, i):
+    """Is interval i inside an animation: steady frames before it, and frames
+    resuming after it? A screen only changes when something moves, so a long
+    interval is a stutter only between steady frames, not a pause."""
+    before = durs[max(0, i - 3):i]
+    return (len(before) == 3 and all(d < STEADY for d in before) and durs[i] <= 1e6
+            and (i + 1 == len(durs) or durs[i + 1] < STEADY))
 # Chromium's frame stages (PipelineReporter), in the words a reader needs.
 STAGES = {
     "BeginImplFrameToSendBeginMainFrame": "the compositor waited to start the page's frame",
@@ -41,7 +51,7 @@ STAGES = {
     "BufferAvailableToBufferReady": "the GPU finishing the frame",
     "BufferReadyToLatch": "waiting for the display to take the frame",
     "LatchToSwapEnd": "the swap after the display took the frame",
-    "SwapEndToPresentationCompositorFrame": "waiting for WindowServer to put the frame on screen",
+    "SwapEndToPresentationCompositorFrame": "the tab's hidden window presenting (not the Rex window: see the screen lanes)",
 }
 STATE_RANK = {"STATE_PRESENTED_ALL": 3, "STATE_PRESENTED_PARTIAL": 2, "STATE_DROPPED": 1}
 
@@ -62,7 +72,8 @@ class Capture:
                 self.pname[pid] = "Engine browser process"
         timed = [e["ts"] for e in events if e.get("ph") != "M" and e.get("ts", 0) > 0]
         self.t0, self.t1 = min(timed), max(timed)
-        self.slices = [e for e in events if e.get("ph") == "X" and e.get("dur", 0) >= BUSY and e.get("cat") != "window"]
+        self.slices = [e for e in events if e.get("ph") == "X" and e.get("dur", 0) >= BUSY
+                       and e.get("cat") not in ("window", "pane")]
         self.by_thread = {}
         for e in self.slices:
             self.by_thread.setdefault((e["pid"], e.get("tid")), []).append(e)
@@ -135,6 +146,12 @@ class Capture:
             # A frame interval counts only inside an animation: both frames
             # animate, and no frame between them had nothing to update. So the
             # pause before an animation starts is not a stutter.
+            # A frame counts as shown when the GPU process hands it to Core
+            # Animation. Chromium's own presentation time comes from the tab's
+            # hidden window in windowed mode, not from the Rex window, and
+            # runs late when the Rex window shows the frame on time.
+            for r in fr:
+                r["ready"] = r["end"] - r["stages"].get("SwapEndToPresentationCompositorFrame", 0)
             prev = None
             for r in fr:
                 f, state = r["fr"], r["fr"].get("state", "")
@@ -144,7 +161,7 @@ class Capture:
                     prev = None
                 elif state.startswith("STATE_PRESENTED"):
                     if prev is not None:
-                        r["interval"] = r["end"] - prev["end"]
+                        r["interval"] = r["ready"] - prev["ready"]
                     prev = r
             typical = {}
             for r in fr:
@@ -156,7 +173,7 @@ class Capture:
     def heartbeats(self):
         per = {}
         for e in self.events:
-            if e.get("ph") not in ("M", "C") and e.get("ts", 0) > 0 and e.get("cat") not in ("rex", "window"):
+            if e.get("ph") not in ("M", "C") and e.get("ts", 0) > 0 and e.get("cat") not in ("rex", "window", "pane"):
                 per.setdefault(e["pid"], []).append(e["ts"])
         span = self.t1 - self.t0
         stamps = {p: sorted(t) for p, t in per.items() if len(t) > span / VSYNC}
@@ -223,10 +240,23 @@ class Capture:
                     late.append(("tab", pid, r["start"], r["end"], r, "dropped"))
                 elif r.get("interval", 0) > LATE:
                     late.append(("tab", pid, r["end"] - r["interval"], r["end"], r, "late"))
-        for e in self.events:
-            if e.get("cat") == "window" and e.get("ph") == "X" and e["dur"] > LATE:
-                late.append(("window", None, e["ts"], e["ts"] + e["dur"], None, "late"))
+        for (cat, pid, tid), frames in self.screen().items():
+            durs = [d for _, d in frames]
+            for i, (ts, d) in enumerate(frames):
+                if d > LATE and animating(durs, i):
+                    late.append((cat, (pid, tid), ts, ts + d, None, "late"))
         return sorted(late, key=lambda x: x[2])
+
+    def screen(self):
+        """(cat, pid, tid) → [(ts, dur)] for each window and pane on screen."""
+        out = {}
+        for e in self.events:
+            if e.get("cat") in ("window", "pane") and e.get("ph") == "X":
+                out.setdefault((e["cat"], e["pid"], e.get("tid")), []).append((e["ts"], e["dur"]))
+        return {k: sorted(v) for k, v in out.items()}
+
+    def screen_name(self, key):
+        return self.tname.get((key[1], key[2]), f"{key[0]} {key[2]}")
 
     def spikes(self):
         out = []
@@ -243,7 +273,8 @@ class Capture:
     def stage_cause(self, sp):
         """The innermost stage that grew the most, as a cause."""
         grown = self.grown_stages(sp)
-        inner = [g for g in grown if g[0][1] != "SubmitCompositorFrameToPresentationCompositorFrame"]
+        inner = [g for g in grown if g[0][1] not in ("SubmitCompositorFrameToPresentationCompositorFrame",
+                                                     "SwapEndToPresentationCompositorFrame")]
         if not (inner or grown):
             return None
         (pid, s), (extra, took, typ) = (inner or grown)[0]
@@ -263,7 +294,7 @@ class Capture:
         return sorted(grown.items(), key=lambda kv: -kv[1][0])[:4]
 
     def verdict(self, sp, busy, silent, load):
-        lanes = {f[0] for f in sp["frames"]}
+        lanes = {"screen" if f[0] in ("window", "pane") else f[0] for f in sp["frames"]}
         gpu = load.get("GPU busy %", {})
         cpu = load.get("CPU %", {})
         if silent:
@@ -274,7 +305,7 @@ class Capture:
         if gpu and sum(gpu.values()) > 90:
             top = max(gpu.items(), key=lambda kv: kv[1])
             return f"GPU saturated ({sum(gpu.values()):.0f}%, most from {top[0]})"
-        if lanes == {"window"}:
+        if lanes == {"screen"}:
             rex = [e for e in busy if self.pname.get(e["pid"]) == "Rex client"]
             if rex:
                 return f"after Chromium: Rex's main thread was busy {rex[0]['dur'] / 1000:.0f} ms"
@@ -321,16 +352,18 @@ class Capture:
 def main(d):
     c = Capture(load(d))
     span = (c.t1 - c.t0) / 1e6
-    window_frames = [(e["ts"] + e["dur"], e["dur"] / 1000) for e in c.events if e.get("cat") == "window" and e.get("ph") == "X"]
+    screen = c.screen()
     print(f"Capture {os.path.basename(d.rstrip('/'))}: {span:.1f} s, {len(c.tabs)} tab(s), "
-          f"Rex window {'on screen' if window_frames else 'off screen (no WindowServer lane)'}")
+          f"Rex window {'on screen' if screen else 'off screen (no lane for what reached the screen)'}")
     print(f"\nWorst frame per {span / STRIP * 1000:.0f} ms   ▁ on time   ▃ 1 missed   ▅ 2–3 missed   █ ≥100 ms")
     for pid, tab in c.tabs.items():
         pts = [(r["end"], r.get("interval", 0) / 1000) for r in tab["frames"]]
         pts += [(r["end"], 100) for r in tab["frames"] if r["fr"].get("state") == "STATE_DROPPED"]
         print(f"  {c.tab_name(pid)[:22]:22s} │{c.strip(pts)}│")
-    if window_frames:
-        print(f"  {'Rex window on screen':22s} │{c.strip(window_frames)}│")
+    for key, frames in screen.items():
+        durs = [dd for _, dd in frames]
+        pts = [(ts + dd, dd / 1000) for i, (ts, dd) in enumerate(frames) if animating(durs, i)]
+        print(f"  {('on screen: ' + c.screen_name(key))[:22]:22s} │{c.strip(pts)}│")
     rex = [(e["ts"] + e["dur"], e["dur"] / 1000) for e in c.events if e.get("cat") == "rex" and e.get("ph") == "X"]
     print(f"  {'Rex main thread busy':22s} │{c.strip(rex)}│")
     if "GPU busy %" in c.counters:
@@ -352,13 +385,25 @@ def main(d):
                      f"1% low {1e6 / statistics.mean(worst):.0f} fps, {sum(i > LATE for i in iv)} late")
         print(line)
 
+    if screen:
+        print("\nOn screen (only while something animates)")
+        for key, frames in screen.items():
+            durs = [dd for _, dd in frames]
+            iv = sorted(dd for i, dd in enumerate(durs) if animating(durs, i))
+            if len(iv) < 20:
+                print(f"  {c.screen_name(key)}: still")
+                continue
+            worst = iv[int(len(iv) * 0.99):]
+            print(f"  {c.screen_name(key)}: p50 {iv[len(iv) // 2] / 1000:.1f} ms, p99 {iv[int(len(iv) * 0.99)] / 1000:.1f} ms, "
+                  f"1% low {1e6 / statistics.mean(worst):.0f} fps, {sum(i > LATE for i in iv)} late")
+
     spikes = c.spikes()
     print(f"\nSpikes: {len(spikes)}")
     for n, sp in enumerate(spikes[:15], 1):
         busy, silent, load_ = c.busy(sp["start"], sp["end"]), c.silent(sp["start"], sp["end"]), c.load(sp["start"], sp["end"])
         what = {}
         for lane, pid, _, kind in sp["frames"]:
-            k = f"{kind} in {'the Rex window' if lane == 'window' else c.tab_name(pid)}"
+            k = f"{kind} " + (f"on screen in {c.screen_name((lane, *pid))}" if lane in ("window", "pane") else f"in {c.tab_name(pid)}")
             what[k] = what.get(k, 0) + 1
         print(f"\n  #{n} at {c.at(sp['start'])}, {(sp['end'] - sp['start']) / 1000:.0f} ms: "
               + ", ".join(f"{v} {k}" for k, v in what.items()))

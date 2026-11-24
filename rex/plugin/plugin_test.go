@@ -430,4 +430,21 @@ func TestTraceRecordsThePagesFramesOnTheReportedClock(t *testing.T) {
 		t.Fatalf("1 s of an animating page shows at least 20 presented frames, in mach time, got %d "+
 			"(%d frames from %.0f to %.0f µs; trace started at %.0f)", presented, reporters, lo, hi, start)
 	}
+	// A recorder throws traces away by stopping without a path; the trace
+	// must end, or it could never start again.
+	if _, err := r.method(b, "trace_start", nil); err != nil {
+		t.Fatalf("trace_start after a written trace: %v", err)
+	}
+	if _, err := r.method(b, "trace_stop", nil); err != nil {
+		t.Fatalf("trace_stop without a path: %v", err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		if _, err := r.method(b, "trace_start", nil); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a trace thrown away has ended: a new one starts")
+		}
+	}
+	r.method(b, "trace_stop", nil)
 }

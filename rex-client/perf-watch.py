@@ -3,9 +3,11 @@
 
   rex-client/perf-watch.py [--gap MS]
 
-Leave it running while you use browser panes. It saves a capture when a Rex
-window shows a frame MS or later (default 50, about 3 missed frames) while it
-is on screen, or when you press ⌃⌥⌘J in the dev Rex. Each capture is
+Leave it running while you use browser panes. It saves a capture when a
+browser pane, or a Rex window, that was animating steadily on screen shows a
+frame MS late or more (default 50, about 3 missed frames) and then animates
+on, or when you press ⌃⌥⌘J in the dev Rex. A pause (nothing moving) is not a
+stutter. Each capture is
 dev/perf/<time>/ with trace.json.gz (ui.perfetto.dev) and report.txt, and it
 prints one line with the verdict. Captures over 200 MB in total
 (PERF_KEEP_MB) are deleted oldest first. Ctrl-C stops it.
@@ -83,6 +85,7 @@ class Watch:
         self.gap_us = gap_ms * 1000
         self.frames, self.load, self.client = Lane(), Lane(), Lane()
         self.client_meta = []
+        self.names = {}
         self.trigger = None  # (ts, why)
         self.cond = threading.Condition()
         self.block = None
@@ -97,22 +100,29 @@ class Watch:
         return p
 
     def read_frames(self, p):
-        last, shown = {}, {}
+        # Per window and per pane: the last frame times. Interval k is a
+        # stutter when it is long, the three before it were steady, and the
+        # one after it is steady again (report.animating, applied live).
+        times, shown = {}, {}
         for line in p.stdout:
             e = json.loads(line)
             w = e["w"]
+            self.frames.add(e["ts"], e)
             if "on" in e:
                 shown[w] = e["ts"] if e["on"] else None
-                last.pop(w, None)
+                for k in [k for k in times if k[0] == w]:
+                    del times[k]
                 print(f"{time.strftime('%H:%M:%S')}  window {w} {'on screen' if e['on'] else 'off screen'}", flush=True)
                 continue
-            prev = last.get(w)
-            last[w] = e["ts"]
-            if prev is None:
+            key = (w, e.get("p"))
+            t = times.setdefault(key, collections.deque(maxlen=6))
+            t.append(e["ts"])
+            if len(t) < 6 or not shown.get(w) or t[0] - shown[w] < SETTLE_US:
                 continue
-            self.frames.add(e["ts"], {"w": w, "ts": prev, "dur": e["ts"] - prev})
-            if e["ts"] - prev >= self.gap_us and shown.get(w) and prev - shown[w] > SETTLE_US:
-                self.fire(prev, f"window {w} froze {(e['ts'] - prev) / 1000:.0f} ms")
+            d = [b - a for a, b in zip(t, list(t)[1:])]  # 5 intervals; the 4th is the candidate
+            if d[3] >= self.gap_us and all(x < report.STEADY for x in d[:3]) and d[4] < report.STEADY:
+                what = f"pane {self.names.get(e['p'], e['p'][-6:])}" if e.get("p") else f"window {w}"
+                self.fire(t[3], f"{what} froze {d[3] / 1000:.0f} ms")
 
     def read_load(self, p):
         for line in p.stdout:
@@ -163,6 +173,18 @@ class Watch:
                 self.block = None
         raise RuntimeError(f"{method}: no browser pane answered")
 
+    def refresh_names(self):
+        """Pane names for the report and the trigger line: each page's title."""
+        names = {}
+        try:
+            for s in rex("ls", "--json")["sessions"]:
+                for b in rex("block", "ls", "-s", s["session_id"], "--json").get("blocks", []):
+                    if b.get("creator_name") == "dev.libbowser":
+                        names[b["block_id"]] = rex("block", "call", "-b", b["block_id"], "state").get("title") or b["block_id"][-6:]
+        except RuntimeError:
+            return
+        self.names = names
+
     def start_trace(self):
         for _ in range(50):
             try:
@@ -187,8 +209,10 @@ class Watch:
         if not self.block:
             sys.exit("open a browser pane in the dev Rex first")
         engine = str(self.call("state")["engine_pid"])
+        self.refresh_names()
         self.load_meta = None
-        threading.Thread(target=self.read_frames, args=(self.spawn(os.path.join(DEV, "framegaps"), "stream", windows),), daemon=True).start()
+        threading.Thread(target=self.read_frames, args=(self.spawn(os.path.join(DEV, "framegaps"), "stream", windows,
+                                                                   os.path.join(DEV, "panes.json")),), daemon=True).start()
         threading.Thread(target=self.read_load, args=(self.spawn(os.path.join(DEV, "sysmon"), "0", "-", clients, engine),), daemon=True).start()
         threading.Thread(target=self.read_client, daemon=True).start()
         if not self.start_trace():
@@ -206,6 +230,7 @@ class Watch:
                 last_capture = time.monotonic()
                 started = time.monotonic()
             elif time.monotonic() - started > ROTATE_S:
+                self.refresh_names()
                 try:
                     self.call("trace_stop")
                 except RuntimeError:
@@ -225,12 +250,11 @@ class Watch:
             print(f"{time.strftime('%H:%M:%S')}  {why}: no trace ({e})", flush=True)
             self.start_trace()
             return
-        with open(os.path.join(d, "window.jsonl"), "w") as f:
-            f.write(json.dumps({"name": "process_name", "ph": "M", "pid": 1, "args": {"name": "WindowServer (Rex windows)"}}) + "\n")
-            for w in {fr["w"] for fr in self.frames.between(lo, hi)}:
-                f.write(json.dumps({"name": "thread_name", "ph": "M", "pid": 1, "tid": w, "args": {"name": f"window {w}"}}) + "\n")
-            for fr in self.frames.between(lo, hi):
-                f.write(json.dumps({"name": "frame", "cat": "window", "ph": "X", "pid": 1, "tid": fr["w"], "ts": fr["ts"], "dur": fr["dur"]}) + "\n")
+        with open(os.path.join(d, "screen.jsonl"), "w") as f:
+            for e in self.frames.between(lo - 1e6, hi):
+                f.write(json.dumps(e) + "\n")
+        with open(os.path.join(d, "names.json"), "w") as f:
+            json.dump(self.names, f)
         with open(os.path.join(d, "load.jsonl"), "w") as f:
             for e in ([self.load_meta] if self.load_meta else []) + self.load.between(lo - 1e6, hi):
                 f.write(json.dumps(e) + "\n")

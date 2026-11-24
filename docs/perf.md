@@ -242,19 +242,42 @@ first frame. What made the first row small:
 
 ## Finding stutter
 
-A screen recording shows that frames were late, not why. `rex-client/perf-trace.sh`
-answers why (see `rex-client/README.md`). It was checked against known causes:
+A screen recording shows that frames were late, not why. The tools in
+`rex-client/` (see its README) say why: `perf-watch.py` catches stutter while
+you use Rex, `perf-trace.sh` records on demand, `perf-load.py` runs scenarios.
+
+The report was checked against planted causes; `perf-load.py` repeats both
+checks on every run:
 
 | Cause, planted | What the report named |
 |---|---|
-| Page script blocks for 120 ms every 2 s | Each spike: `FunctionCall (jank)` on the renderer's main thread, 120 ms |
-| GPU process stopped for 150 ms (`SIGSTOP`) | One spike: `GPU Process logged nothing`, 147.6 ms |
+| Page script blocks for 120 ms every 2 s | `FunctionCall (plantedJank)` on the renderer's main thread, 120 ms |
+| GPU process stopped for 150 ms (`SIGSTOP`) | `GPU Process went silent`, 148 ms |
 
-On ribbet-is-you at 1400 frogs, the frog tab misses about 1 frame in 200, each
-by one vsync: the page's main thread (4–13 ms) and the GPU process's canvas
-raster (7–12 ms) together exceed 16.7 ms. That is the page's own cost. The
-engine's GPU process ran at 21–36 % GPU busy, so the GPU was not saturated.
+### Load (2026-11-24, Rex window off screen)
 
-Not measured yet: the Rex window lane during a stutter you can see. It needs
-the window on the current Space.
+`perf-load.py --secs 8`. Late = frame intervals over 1.5 vsyncs while the
+page animates, summed over the panes; 1% low is the worst pane's.
 
+| Scenario | Windowed: late / 1% low | OSR: late / 1% low |
+|---|---|---|
+| 1 pane, light | 0 / 60 fps | |
+| 4 panes, light | 22–33 / 30 fps | 0 / 52 fps |
+| 8 panes, light | 128 / 30 fps | |
+| 4 panes, heavy canvas | 416–471 / 30 fps | 6 / 30 fps |
+| smooth scrolling | 5 / 30 fps | |
+| pane open/close beside an animation | 1 / 50 fps | |
+
+In windowed mode the late frames grow with the number of panes, and most
+are "waiting for WindowServer to put the frame on screen": the frame was
+drawn and swapped on time, and its presentation came a vsync late. Each page
+draws through its own hidden window, and these windows are not on screen.
+
+Not settled: whether this happens on screen too. OSR's presentation time is
+when the engine copies the frame, not when WindowServer shows it, so the two
+columns are not strictly comparable, and with the Rex window off screen
+nothing here was composited. Next: the same scenarios with the Rex window on
+the current Space, where the window lane shows what reaches the screen.
+
+Tracing costs the engine about 8 % of one core while it runs (58 → 66 % on
+ribbet-is-you).
