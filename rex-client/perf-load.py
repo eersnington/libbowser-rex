@@ -132,8 +132,7 @@ def summarize(d):
     for key, frames in c.screen().items():
         if key[0] != "pane":
             continue
-        durs = [d for _, d in frames]
-        iv = sorted(d for i, d in enumerate(durs) if report.animating(durs, i))
+        iv = sorted(d for _, d in c.screen_intervals(key))
         if len(iv) < 20:
             continue
         worst = iv[int(len(iv) * 0.99):]
@@ -143,6 +142,8 @@ def summarize(d):
         window["low"] = min(window["low"], pane["low"])
         window["late"] += pane["late"]
         window["panes"][pane["name"]] = pane["late"]
+    if window is not None:
+        window["frozen"] = [c.tab_name(pid) for pid, _ in c.frozen_tabs()]
     return rows, verdicts, load, window, len(c.spikes())
 
 
@@ -183,10 +184,18 @@ SCENARIOS = [
     ("check: planted page jank", [JANK], None, lambda v, w: any("plantedJank" in k for k in v)),
     ("check: GPU process stopped", [ANIM], "gpu", lambda v, w: any("GPU Process went silent" in k for k in v)),
     # Two panes, one janky: the window keeps changing (the other pane), so
-    # only the per-pane lane can show which one stuttered.
+    # only the per-pane lane can show which one stuttered. The jank fires
+    # every 2 s; a smooth pane may drop a frame or two in 8 s.
+    # Panes opened back to back each show their page. The engine once left
+    # about 4 in 10 of them blank: Chromium set up its layer before the
+    # view was in the tab's window, and the mirror never learned of it.
+    ("check: new panes all show their pages", [ANIM] * 4, None,
+     lambda v, w: None if not w else not w["frozen"] and len(w["panes"]) == 4),
     ("check: one janky pane on screen", [ANIM, JANK], None,
-     lambda v, w: None if not w else (any(n.startswith("pane jank") and late > 0 for n, late in w["panes"].items())
-                                       and all(late == 0 for n, late in w["panes"].items() if n.startswith("pane anim")))),
+     lambda v, w: None if not w else (
+         sum(late for n, late in w["panes"].items() if n.startswith("pane jank")) >= 3
+         and sum(late for n, late in w["panes"].items() if n.startswith("pane jank"))
+         > 2 * sum(late for n, late in w["panes"].items() if n.startswith("pane anim")))),
 ]
 
 
@@ -215,6 +224,8 @@ def main():
         print(f"{name:28s} {worst['tab'][:12]:12s} {worst['fps']:5.1f} {worst['p99']:6.1f} {worst['low']:6.0f} "
               f"{sum(r['late'] for r in rows):5d} {sum(r['dropped'] for r in rows):5d}  {gpu:5.0f} {cpu:5.0f}  "
               + (f"worst pane 1% low {window['low']:.0f}, {window['late']} late" if window else "off screen"))
+        if window and window["frozen"]:
+            print(f"{'':28s}   ⚠ {len(window['frozen'])} tab(s) animate but their pane on screen doesn't change: blank or frozen pane")
         for v, n in sorted(verdicts.items(), key=lambda kv: -kv[1])[:3]:
             print(f"{'':28s}   {n}× {v}")
         if check:
@@ -223,7 +234,7 @@ def main():
                 print(f"{'':28s}   skipped: needs the Rex window on screen")
                 continue
             failed |= not ok
-            print(f"{'':28s}   {'ok' if ok else 'FAIL'}: the report names the planted cause")
+            print(f"{'':28s}   {'ok' if ok else 'FAIL'}")
         if not a.keep:
             shutil.rmtree(d, ignore_errors=True)
     sess.show([ANIM], None)

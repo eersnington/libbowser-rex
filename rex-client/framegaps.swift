@@ -124,7 +124,8 @@ if args.count >= 3, args[1] == "stream" {
       let now = region(buf, rect, scale)
       let key = "\(id) \(block)"
       let before = lock.withLock { previous.updateValue(now, forKey: key) }
-      if let before, before.count == now.count, before != now {
+      // A pane that changed size changed on screen too.
+      if let before, before.count != now.count || before != now {
         print("{\"w\":\(id),\"p\":\"\(block)\",\"ts\":\(ts)}")
       }
     }

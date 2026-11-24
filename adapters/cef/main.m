@@ -1680,7 +1680,9 @@ static NSDictionary *run_command(NSDictionary *cmd) {
     NSString *url = [typed isKindOfClass:NSString.class] ? fixup_url(typed) : nil;
     NSString *error;
     Tab *t = windowed && transport == BOWSER_TRANSPORT_CALAYERHOST ? take_spare(url ?: @"about:blank") : nil;
+    bool spare = t != nil;
     if (!t) t = open_tab(url ?: @"about:blank", transport, windowed, &error);
+    if (t) ENGINE_LOG("%s: opened, %s\n", t->sid.UTF8String, spare ? "the spare tab" : "a new tab");
     // Whoever opened it is about to attach a host: render the first frame now.
     if (t && t->windowed) windowed_await_host(t);
     return t ? @{@"surface" : t->sid, @"mode" : windowed ? @"windowed" : @"osr"} : @{@"error" : error};

@@ -240,20 +240,87 @@ class Capture:
                     late.append(("tab", pid, r["start"], r["end"], r, "dropped"))
                 elif r.get("interval", 0) > LATE:
                     late.append(("tab", pid, r["end"] - r["interval"], r["end"], r, "late"))
-        for (cat, pid, tid), frames in self.screen().items():
-            durs = [d for _, d in frames]
-            for i, (ts, d) in enumerate(frames):
-                if d > LATE and animating(durs, i):
-                    late.append((cat, (pid, tid), ts, ts + d, None, "late"))
+        for key in self.screen():
+            for ts, d in self.screen_intervals(key):
+                if d > LATE:
+                    late.append((key[0], key[1:], ts, ts + d, None, "late"))
         return sorted(late, key=lambda x: x[2])
+
+    def pane_tab(self, key):
+        """The tab whose frames this pane's pixels follow. Each pane and tab
+        pair scores the share of the tab's shown frames that a pixel change
+        follows within a frame and a half; pairs are taken best first, each
+        pane and tab once, so identical pages in step still pair up. None
+        when nothing scores over half."""
+        if not hasattr(self, "_pane_tab"):
+            panes = [k for k in self.screen() if k[0] == "pane"]
+            scores = []
+            for k in panes:
+                changes = [ts + d for ts, d in self.screen()[k]]
+                for pid, tab in self.tabs.items():
+                    ready = [r["ready"] for r in tab["frames"] if r["fr"].get("state", "").startswith("STATE_PRESENTED")]
+                    if len(ready) < 20:
+                        continue
+                    hit = sum(1 for t in ready if (i := bisect.bisect_left(changes, t)) < len(changes) and changes[i] - t < LATE)
+                    scores.append((hit / len(ready), k, pid))
+            self._pane_tab, used = {}, set()
+            for score, k, pid in sorted(scores, key=lambda x: -x[0]):
+                if score > 0.5 and k not in self._pane_tab and pid not in used:
+                    self._pane_tab[k] = pid
+                    used.add(pid)
+        return self._pane_tab.get(key)
+
+    def frozen_tabs(self):
+        """Tabs that animate in Chromium while no pane on screen follows them:
+        the page draws, but its pane shows a blank or stale picture."""
+        screen = self.screen()
+        if not any(k[0] == "pane" for k in screen):
+            return []
+        shown = {self.pane_tab(k) for k in screen if k[0] == "pane"}
+        out = []
+        for pid, tab in self.tabs.items():
+            n = sum(1 for r in tab["frames"] if "interval" in r)
+            if n >= 20 and pid not in shown:
+                out.append((pid, n))
+        return out
+
+    def paused(self, pids, start, end):
+        """Did these tabs say they had nothing to draw between start and end?
+        A page that paused says so; a blocked page, or a frame lost after
+        Chromium, does not."""
+        for pid in pids:
+            for r in self.tabs.get(pid, {}).get("frames", []):
+                if start < r["start"] < end and r["fr"].get("state") == "STATE_NO_UPDATE_DESIRED":
+                    return True
+        return False
+
+    def screen_intervals(self, key):
+        """(ts, dur) of a window's or pane's frames while it animates: steady
+        before and after (animating), and, when the trace shows it, its tab
+        wanted a frame meanwhile. A page that paused is not a stutter."""
+        frames = self.screen()[key]
+        durs = [d for _, d in frames]
+        tabs = [self.pane_tab(key)] if key[0] == "pane" else list(self.tabs)
+        tabs = [t for t in tabs if t is not None]
+        out = []
+        for i, (ts, d) in enumerate(frames):
+            if not animating(durs, i):
+                continue
+            if d > LATE and tabs and self.paused(tabs, ts, ts + d):
+                continue
+            out.append((ts, d))
+        return out
 
     def screen(self):
         """(cat, pid, tid) → [(ts, dur)] for each window and pane on screen."""
+        if hasattr(self, "_screen"):
+            return self._screen
         out = {}
         for e in self.events:
             if e.get("cat") in ("window", "pane") and e.get("ph") == "X":
                 out.setdefault((e["cat"], e["pid"], e.get("tid")), []).append((e["ts"], e["dur"]))
-        return {k: sorted(v) for k, v in out.items()}
+        self._screen = {k: sorted(v) for k, v in out.items()}
+        return self._screen
 
     def screen_name(self, key):
         return self.tname.get((key[1], key[2]), f"{key[0]} {key[2]}")
@@ -360,9 +427,8 @@ def main(d):
         pts = [(r["end"], r.get("interval", 0) / 1000) for r in tab["frames"]]
         pts += [(r["end"], 100) for r in tab["frames"] if r["fr"].get("state") == "STATE_DROPPED"]
         print(f"  {c.tab_name(pid)[:22]:22s} │{c.strip(pts)}│")
-    for key, frames in screen.items():
-        durs = [dd for _, dd in frames]
-        pts = [(ts + dd, dd / 1000) for i, (ts, dd) in enumerate(frames) if animating(durs, i)]
+    for key in screen:
+        pts = [(ts + dd, dd / 1000) for ts, dd in c.screen_intervals(key)]
         print(f"  {('on screen: ' + c.screen_name(key))[:22]:22s} │{c.strip(pts)}│")
     rex = [(e["ts"] + e["dur"], e["dur"] / 1000) for e in c.events if e.get("cat") == "rex" and e.get("ph") == "X"]
     print(f"  {'Rex main thread busy':22s} │{c.strip(rex)}│")
@@ -387,15 +453,18 @@ def main(d):
 
     if screen:
         print("\nOn screen (only while something animates)")
-        for key, frames in screen.items():
-            durs = [dd for _, dd in frames]
-            iv = sorted(dd for i, dd in enumerate(durs) if animating(durs, i))
+        for key in screen:
+            iv = sorted(dd for _, dd in c.screen_intervals(key))
             if len(iv) < 20:
                 print(f"  {c.screen_name(key)}: still")
                 continue
             worst = iv[int(len(iv) * 0.99):]
             print(f"  {c.screen_name(key)}: p50 {iv[len(iv) // 2] / 1000:.1f} ms, p99 {iv[int(len(iv) * 0.99)] / 1000:.1f} ms, "
                   f"1% low {1e6 / statistics.mean(worst):.0f} fps, {sum(i > LATE for i in iv)} late")
+
+    for pid, n in c.frozen_tabs():
+        print(f"  ⚠ {c.tab_name(pid)} drew {n} animating frames, but no pane on screen changed with them: "
+              "a blank or frozen pane")
 
     spikes = c.spikes()
     print(f"\nSpikes: {len(spikes)}")

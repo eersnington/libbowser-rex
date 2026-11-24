@@ -22,9 +22,9 @@ All captures together stay under 200 MB (`PERF_KEEP_MB`); the oldest go first.
 
 | Tool | Use it when |
 |---|---|
-| `perf-watch.py` | You use the browser and want each stutter caught. Leave it running. It saves the 6 s before a Rex window shows a frame of 50 ms or more (`--gap`), or before you press **⌃⌥⌘J** in the dev Rex. |
+| `perf-watch.py` | You use the browser and want each stutter caught. Leave it running. It saves the 6 s before a pane that was animating steadily on screen shows a frame 50 ms late or more (`--gap`) and then animates on, or before you press **⌃⌥⌘J** in the dev Rex. |
 | `perf-trace.sh SECS` | You can make it stutter on purpose: record now, for SECS. |
-| `perf-load.py` | Load tests: scripted scenarios in the `loadtest` session (`dev/restore.sh` makes it), one row each. Two scenarios plant a known cause and fail if the report misses it. |
+| `perf-load.py` | Load tests: scripted scenarios in the `loadtest` session (`dev/restore.sh` makes it, in its own window), one row each. Four `check:` scenarios plant a known cause, or a known bug, and fail if the report misses it. Run it with Space 3 on screen to get the pane lanes. |
 
 The report shows each lane as a strip, so a stutter lines up across them,
 and each spike with a verdict:
@@ -45,6 +45,7 @@ and each spike with a verdict:
 | Chromium | engine `trace_start`/`trace_stop` | Each frame of each tab through its stages, from the page's main thread to WindowServer; dropped frames; the script, layout or raster that ran |
 | Rex client | `BOWSER_REX_PERF` (`run.sh` sets it) | Main-thread turns of 4 ms or more, pane layouts, mounts, attaches, ⌃⌥⌘J |
 | Rex windows | `framegaps.swift` (ScreenCaptureKit) | Each frame WindowServer composited for each Rex window, while it is on the current Space |
+| Panes on screen | `framegaps.swift` and `BOWSER_REX_PANES` (`run.sh` sets it) | When each browser pane's own pixels changed. The window can't tell: with two panes, one keeps it changing while the other stutters. Pixels are compared in memory at half size and never kept. |
 | Load | `sysmon.swift` | GPU busy per process (IOKit) and CPU, every 50 ms. Other apps only as one total |
 
 How to read a verdict:
@@ -53,10 +54,21 @@ How to read a verdict:
 |---|---|
 | the page's main thread | The page's own script, style, layout or paint. Any browser pays it. |
 | Chromium's GPU process was busy | Raster or drawing in the engine |
-| a stage name (rasterizing, drawing, waiting for WindowServer) | The stage that grew most against the tab's usual frame |
+| a stage name (rasterizing, drawing, …) | The stage that grew most against the tab's usual frame |
 | … went silent | That process was stopped, starved of CPU, or blocked in the kernel |
 | GPU saturated | Everything on the Mac wanted the GPU |
-| after Chromium | The page presented on time but the Rex window didn't update: Rex or WindowServer |
+| after Chromium | The page presented on time but its pane on screen didn't change: Rex or WindowServer |
+
+Two rules keep pauses from looking like stutter. On screen, a long frame
+counts only between steady frames, with frames resuming after it, and not
+while the page's tab said it had nothing to draw. And a tab's frames are
+timed when the GPU process hands them to Core Animation: Chromium's own
+"presented" time comes from the tab's hidden window, which runs late while
+the Rex window shows the frame on time.
+
+**⚠ blank or frozen pane** means a tab drew animating frames but no pane on
+screen changed with them. Each pane is matched to the tab whose frames its
+pixels follow.
 
 Chromium's trace buffer stops recording when full (about 640 MB, 2 minutes
 of one busy tab), so `perf-watch.py` throws it away and restarts it every
@@ -92,7 +104,9 @@ Mouse buttons 4 and 5 go back and forward. A click in the page focuses the pane
 with Rex's own `onFocus` action, and Rex focusing the pane gives the page the
 keyboard.
 
-Dev hooks: `BOWSER_REX_KEYS` + `kill -INFO` replays key lines (`cmd+l`,
+Dev hooks: `BOWSER_REX_KEYS` + `kill -INFO` replays key lines into the browser
+pane that last took the keyboard, and drops them when it no longer has it, so
+they never type into a terminal (`cmd+l`,
 `type:text`, `enter`, `esc`) through `NSApp.sendEvent`, for testing without
 clicking. `BOWSER_REX_CREATOR` treats another creator's blocks as ours, and
 `BOWSER_REX_TICKET` uses a fixed ticket instead of asking the block.

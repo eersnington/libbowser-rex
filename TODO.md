@@ -102,6 +102,8 @@ paint callback; CPU is `ps` CPU time over the scroll, as % of one core.
 - [x] Typing in windowed mode: each key types once; text waits for its key press; a key the page cancels types nothing (`rex-client/check-typing.sh`)
 - [x] Pane startup: mount → attached p90 2.8 ms; warm engine, spare page, ticket socket, attach in the mounting turn (docs/perf.md)
 - [ ] A harness test for the two Rex-only typing bugs: the same events in `tests/cef.m` don't reproduce them
+- [x] Panes that stayed blank after opening back to back: the engine missed Chromium's layer host (docs/perf.md)
+- [ ] A page next to a pane that opens or closes stutters for a frame or more per resize (perf-load.py)
 - [ ] Rex's own pane latency (about 40 ms from block to mounted pane, and 100–200 ms of window layout) is outside libbowser
 - [x] Pane focus: a click calls Rex's `onFocus`; Rex focus gives the page the keyboard
 - [x] Native chrome: address bar (⌘L), find bar (⌘F), loading line; Edit menu keys; reload, zoom

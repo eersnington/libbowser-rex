@@ -404,16 +404,58 @@ static void mirror_layer_host(CALayerHost *host) {
   [CATransaction commit];
 }
 
+// The hooks miss a CALayerHost that Chromium set up before its view was in
+// the tab's window (a spare tab's, made ahead): nothing leads from it to a
+// tab yet, and nothing changes later to call them again. So whenever a tab
+// is about to be shown, find Chromium's layer hosts in its window.
+static void find_layer_hosts(CALayer *l, Tab *t) {
+  if (object_getClass(l) == layerHostClass && l != t->win->mirror && l != t->win->popupMirror)
+    mirror_layer_host((CALayerHost *)l);
+  for (CALayer *sub in l.sublayers) find_layer_hosts(sub, t);
+}
+
+static void resync_mirror(Tab *t) {
+  if (t->win) find_layer_hosts(t->win->window.contentView.layer, t);
+}
+
 static IMP orig_setContextId;
 static void hooked_setContextId(CALayerHost *self, SEL _cmd, uint32_t cid) {
   ((void (*)(id, SEL, uint32_t))orig_setContextId)(self, _cmd, cid);
   mirror_layer_host(self); // no tab yet if it isn't in a view: then addSublayer: finds it
 }
 
-static IMP orig_addSublayer;
+// Every way a layer joins a tree: Chromium uses more than addSublayer:, and
+// a host it adds another way would leave the pane on the old page.
+// The layer may be the root of a subtree Chromium built first, with the host
+// inside it: search all of it.
+static void joined(CALayer *layer) {
+  if (object_getClass(layer) == layerHostClass) mirror_layer_host((CALayerHost *)layer);
+  for (CALayer *sub in layer.sublayers) joined(sub);
+}
+static IMP orig_addSublayer, orig_insertAtIndex, orig_insertBelow, orig_insertAbove, orig_replace, orig_setSublayers;
 static void hooked_addSublayer(CALayer *self, SEL _cmd, CALayer *layer) {
   ((void (*)(id, SEL, CALayer *))orig_addSublayer)(self, _cmd, layer);
-  if (object_getClass(layer) == layerHostClass) mirror_layer_host((CALayerHost *)layer);
+  joined(layer);
+}
+static void hooked_insertAtIndex(CALayer *self, SEL _cmd, CALayer *layer, unsigned idx) {
+  ((void (*)(id, SEL, CALayer *, unsigned))orig_insertAtIndex)(self, _cmd, layer, idx);
+  joined(layer);
+}
+static void hooked_insertBelow(CALayer *self, SEL _cmd, CALayer *layer, CALayer *sibling) {
+  ((void (*)(id, SEL, CALayer *, CALayer *))orig_insertBelow)(self, _cmd, layer, sibling);
+  joined(layer);
+}
+static void hooked_insertAbove(CALayer *self, SEL _cmd, CALayer *layer, CALayer *sibling) {
+  ((void (*)(id, SEL, CALayer *, CALayer *))orig_insertAbove)(self, _cmd, layer, sibling);
+  joined(layer);
+}
+static void hooked_replace(CALayer *self, SEL _cmd, CALayer *old, CALayer *layer) {
+  ((void (*)(id, SEL, CALayer *, CALayer *))orig_replace)(self, _cmd, old, layer);
+  joined(layer);
+}
+static void hooked_setSublayers(CALayer *self, SEL _cmd, NSArray<CALayer *> *layers) {
+  ((void (*)(id, SEL, NSArray *))orig_setSublayers)(self, _cmd, layers);
+  for (CALayer *l in layers) joined(l);
 }
 
 void windowed_init(void) {
@@ -421,6 +463,11 @@ void windowed_init(void) {
   popupOwners = [NSMapTable weakToWeakObjectsMapTable];
   swizzle(layerHostClass, @selector(setContextId:), (IMP)hooked_setContextId, &orig_setContextId);
   swizzle(CALayer.class, @selector(addSublayer:), (IMP)hooked_addSublayer, &orig_addSublayer);
+  swizzle(CALayer.class, @selector(insertSublayer:atIndex:), (IMP)hooked_insertAtIndex, &orig_insertAtIndex);
+  swizzle(CALayer.class, @selector(insertSublayer:below:), (IMP)hooked_insertBelow, &orig_insertBelow);
+  swizzle(CALayer.class, @selector(insertSublayer:above:), (IMP)hooked_insertAbove, &orig_insertAbove);
+  swizzle(CALayer.class, @selector(replaceSublayer:with:), (IMP)hooked_replace, &orig_replace);
+  swizzle(CALayer.class, @selector(setSublayers:), (IMP)hooked_setSublayers, &orig_setSublayers);
 
   Class window = NSWindow.class;
   if (class_getInstanceMethod(window, NSSelectorFromString(@"_doOrderWindow:")))
@@ -871,6 +918,7 @@ static void post_occlusion(Tab *t);
 void windowed_await_host(Tab *t) {
   t->awaitingHost = true;
   post_occlusion(t);
+  resync_mirror(t);
   // A host that never comes stops the drawing after a while.
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
     if (!t->awaitingHost || !t->win) return;
@@ -883,6 +931,7 @@ void windowed_attach(Tab *t, bool attached) {
   t->awaitingHost = false;
   if (!attached) set_key(t, false);
   post_occlusion(t);
+  if (attached) resync_mirror(t);
 }
 
 static void post_occlusion(Tab *t) {
@@ -905,6 +954,7 @@ void windowed_created(Tab *t) {
   bv.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
   bv.frame = t->win->window.contentView.bounds;
   post_occlusion(t);
+  resync_mirror(t);
   if (t->focused) windowed_focus(t, true);
 }
 

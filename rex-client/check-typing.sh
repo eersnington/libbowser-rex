@@ -9,7 +9,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 dev="$here/dev"
 rexdev="$dev/rexdev"
 pid=$(cat "$dev/client.pid")
-session=$("$rexdev" api call session.list '{}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["sessions"][0]["session_id"])')
+# The load-test session (dev/restore.sh), never someone's own: else the first.
+session=$("$rexdev" api call session.list '{}' | python3 -c 'import sys,json;s=json.load(sys.stdin)["sessions"];print(next((x["session_id"] for x in s if x.get("label")=="loadtest"),s[0]["session_id"]))')
 
 key() { printf '%s\n' "$1" > "$dev/keys.txt"; kill -INFO "$pid"; sleep 0.09; }
 type_slow() { s="$1"; while [ -n "$s" ]; do c="${s%"${s#?}"}"; s="${s#?}"; key "type:$c"; done; }

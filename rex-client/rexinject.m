@@ -28,6 +28,8 @@ char *bowser_mirror_tree(id object, long depth);
 // From RexBowser.swift.
 void rex_bowser_install(void);
 BOOL rex_bowser_handle_key(NSEvent *event);
+NSWindow *rex_bowser_typing_window(void);
+void rex_bowser_trace_c(const char *line);
 
 static void trace(const char *fmt, ...) {
   const char *path = getenv("BOWSER_REX_TRACE");
@@ -216,8 +218,13 @@ static void send_key(NSWindow *w, NSString *chars, unsigned short code, NSEventM
 
 static void play_keys(void) {
   const char *path = getenv("BOWSER_REX_KEYS");
-  NSWindow *w = NSApp.keyWindow ?: NSApp.mainWindow ?: NSApp.orderedWindows.firstObject;
-  if (!path || !w) return;
+  // Only into a browser pane that has the keyboard, never a terminal.
+  NSWindow *w = rex_bowser_typing_window();
+  if (!path) return;
+  if (!w) {
+    rex_bowser_trace_c("keys: no browser pane has the keyboard; dropped");
+    return;
+  }
   // US layout key codes, so pages see the key a keyboard would send.
   NSDictionary *codes = @{
     @"a" : @0,  @"s" : @1,  @"d" : @2,  @"f" : @3,  @"h" : @4,  @"g" : @5,  @"z" : @6,  @"x" : @7,  @"c" : @8,

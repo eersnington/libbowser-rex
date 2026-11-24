@@ -585,8 +585,12 @@ final class BowserPaneView: NSView, NSTextInputClient {
 
   override func becomeFirstResponder() -> Bool {
     if let host { bowser_host_focus(host, true) }
+    BowserPaneView.lastFocused = self
     return true
   }
+
+  /// The pane that last took the keyboard: dev key replay types only there.
+  static weak var lastFocused: BowserPaneView?
   override func resignFirstResponder() -> Bool {
     if let host { bowser_host_focus(host, false) }
     return true
@@ -695,6 +699,20 @@ private func keyboardPane(in window: NSWindow) -> BowserPaneView? {
     view = v.superview
   }
   return nil
+}
+
+/// Dev key replay (BOWSER_REX_KEYS): the window of the browser pane that last
+/// took the keyboard, if it still has it. Never a terminal: replayed keys must
+/// not type into someone's shell.
+@_cdecl("rex_bowser_trace_c")
+public func rexBowserTraceC(_ line: UnsafePointer<CChar>) { rexTrace(String(cString: line)) }
+
+@_cdecl("rex_bowser_typing_window")
+public func rexBowserTypingWindow() -> NSWindow? {
+  guard let pane = BowserPaneView.lastFocused, let w = pane.window,
+    let first = w.firstResponder as? NSView, first.isDescendant(of: pane)
+  else { return nil }
+  return w
 }
 
 /// From the NSApplication.sendEvent hook: true when a browser pane took the key.

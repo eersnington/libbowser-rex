@@ -254,30 +254,48 @@ checks on every run:
 | Page script blocks for 120 ms every 2 s | `FunctionCall (plantedJank)` on the renderer's main thread, 120 ms |
 | GPU process stopped for 150 ms (`SIGSTOP`) | `GPU Process went silent`, 148 ms |
 
-### Load (2026-11-24, Rex window off screen)
+### Load, on screen (2026-11-24)
 
-`perf-load.py --secs 8`. Late = frame intervals over 1.5 vsyncs while the
-page animates, summed over the panes; 1% low is the worst pane's.
+`perf-load.py --secs 8` with the Rex window on the current Space. "On
+screen" is each pane's own pixels; "Chromium" is the tab's frames as the GPU
+process hands them to Core Animation. Late = an interval over 1.5 vsyncs
+inside an animation, summed over panes; 1% low is the worst pane's.
 
-| Scenario | Windowed: late / 1% low | OSR: late / 1% low |
+| Scenario | Chromium: late / 1% low | On screen: late / 1% low |
 |---|---|---|
-| 1 pane, light | 0 / 60 fps | |
-| 4 panes, light | 22–33 / 30 fps | 0 / 52 fps |
-| 8 panes, light | 128 / 30 fps | |
-| 4 panes, heavy canvas | 416–471 / 30 fps | 6 / 30 fps |
-| smooth scrolling | 5 / 30 fps | |
-| pane open/close beside an animation | 1 / 50 fps | |
+| 1 pane, light | 0 / 52 fps | 1 / 43 fps |
+| 4 panes, light | 0 / 50 | 0 / 45 |
+| 8 panes, light | 14 / 36 | 0 / 52 |
+| 1 pane, heavy canvas | 62 / 29 | 7 / 29 |
+| 4 panes, heavy canvas | 39 / 26 | 0 / 53 |
+| 4 panes, light, **OSR** | 0 / 46 | **322 / 18** |
+| 4 panes, heavy canvas, **OSR** | 1 / 46 | **81 / 29** |
+| smooth scrolling | 0 / 51 | 1 / 42 |
+| a pane opens and closes beside an animation, once a second | 0 / 55 | 12 / 5 |
 
-In windowed mode the late frames grow with the number of panes, and most
-are "waiting for WindowServer to put the frame on screen": the frame was
-drawn and swapped on time, and its presentation came a vsync late. Each page
-draws through its own hidden window, and these windows are not on screen.
+- **Windowed holds up with many panes.** 4 or 8 animating panes lose no
+  frames on screen.
+- **OSR loses frames after Chromium**: the page draws on time, and its pane
+  doesn't change. Windowed, the default, is right.
+- **Opening or closing a pane next to an animating page makes it stutter**:
+  each resize costs it a frame or more, and its renderer goes quiet
+  meanwhile. Not fixed.
+- Off screen, Chromium reported many late frames with several windowed
+  panes ("waiting for WindowServer"). That is the tabs' hidden windows
+  presenting late, not the Rex window: on screen the same panes lose none.
 
-Not settled: whether this happens on screen too. OSR's presentation time is
-when the engine copies the frame, not when WindowServer shows it, so the two
-columns are not strictly comparable, and with the Rex window off screen
-nothing here was composited. Next: the same scenarios with the Rex window on
-the current Space, where the window lane shows what reaches the screen.
+### Fixed: panes that stay blank
+
+The pane lane found panes that never showed their page: the tab drew, the
+pane stayed empty. Opening four panes back to back left 1 or 2 of them blank
+(7 of 18 panes in one run). The mirror of Chromium's layer never learned the
+tab's context: Chromium had added its CALayerHost inside a subtree, or by an
+insert method, or before its view was in the tab's window, and the engine
+only watched `addSublayer:` of the host itself. It now watches every way a
+layer joins a tree, searches the subtree, and looks for hosts again when a
+tab is shown. `perf-load.py`'s "new panes all show their pages" failed 3 of 3
+before and passes 4 of 4 after. The standalone CEF harness could not provoke
+it, so the check lives in the Rex load test.
 
 Tracing costs the engine about 8 % of one core while it runs (58 → 66 % on
 ribbet-is-you).
