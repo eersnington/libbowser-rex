@@ -228,13 +228,23 @@ final class BowserPaneView: NSView, NSTextInputClient {
     super.viewDidMoveToWindow()
     PaneRects.changed()
     NotificationCenter.default.removeObserver(self, name: NSWindow.didChangeScreenNotification, object: nil)
+    NotificationCenter.default.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: nil)
     if let window {
       NotificationCenter.default.addObserver(
         self, selector: #selector(screenChanged), name: NSWindow.didChangeScreenNotification, object: window)
+      NotificationCenter.default.addObserver(
+        self, selector: #selector(windowBecameKey), name: NSWindow.didBecomeKeyNotification, object: window)
       attach()
     } else {
       detach()
     }
+  }
+
+  /// A page has one host at a time. When the same pane shows in two Rex
+  /// windows, the window last mounted takes it and the other goes blank, so
+  /// the window you turn to takes it back.
+  @objc private func windowBecameKey() {
+    if host == nil, !isHiddenOrHasHiddenAncestor { attach() }
   }
 
   /// The engine puts its hidden window on this display, so the page renders
@@ -531,6 +541,7 @@ final class BowserPaneView: NSView, NSTextInputClient {
   }
 
   override func mouseDown(with e: NSEvent) {
+    if host == nil { attach() }  // a click on a pane another window took
     // Tell Rex first, the way its pane header does, so its focus and the
     // inactive-pane fade follow the click.
     if let pane, !paneIsFocused(pane, blockID: blockID) { paneFocusAction(pane)?() }
