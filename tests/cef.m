@@ -331,6 +331,14 @@ static void test_typed_hosts_get_a_scheme(void) {
   [e message:@"navigate" to:sid body:@{@"url" : @"  bowser.invalid/path  "}];
   NSDictionary *st = [e state:sid where:^BOOL(NSDictionary *s) { return [s[@"url"] hasPrefix:@"https://bowser"]; }];
   CHECK([st[@"url"] isEqual:@"https://bowser.invalid/path"], "a bare host loads over https: %s", e.log.description.UTF8String);
+
+  // A typed path to a file on disk opens the file, as a page someone just wrote.
+  NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"bowser typed path.html"];
+  [@"<title>From disk</title>" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+  [e message:@"navigate" to:sid body:@{@"url" : path}];
+  st = [e state:sid where:^BOOL(NSDictionary *s) { return [s[@"title"] isEqual:@"From disk"]; }];
+  CHECK([st[@"title"] isEqual:@"From disk"], "a typed path opens the file: %s", e.log.description.UTF8String);
+  [NSFileManager.defaultManager removeItemAtPath:path error:nil];
   [e.proc stop];
 }
 

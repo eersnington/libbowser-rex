@@ -1,6 +1,7 @@
 #!/bin/sh
 # End to end through the real Rex client: open a page in a browser pane, type
-# into it one key at a time like a person, and check what the page got.
+# into it one key at a time like a person, and check what the page got. Also
+# the browser keys: ⌘L to load an address, ⌘[ to go back.
 # Needs the dev Rex running (run.sh server, run.sh client). Keys go through
 # the client's own NSApp.sendEvent (rexinject.m), so they take the same path
 # as a keyboard: Rex, the pane's NSTextInputContext, libbowser, the engine.
@@ -27,6 +28,21 @@ check() {
   if [ "$got" = "$4" ]; then echo "ok   $1"; else echo "FAIL $1: got '$got', want '$4'"; failed=1; fi
 }
 
+# check_keys NAME HTML WANT KEY…: send key lines ("wait" pauses 2 s), then
+# compare the page's "title, can go forward" with WANT.
+check_keys() {
+  name=$1 html=$2 want=$3
+  shift 3
+  url=$(python3 -c 'import sys,urllib.parse;print("url=data:text/html,"+urllib.parse.quote(sys.argv[1]))' "$html")
+  block=$("$rexdev" do browser -s "$session" "$url" | python3 -c 'import sys,json;print(json.load(sys.stdin)["block_ids"][0])')
+  sleep 1.5
+  for k in "$@"; do if [ "$k" = wait ]; then sleep 2; else key "$k"; fi; done
+  sleep 2
+  got=$("$rexdev" block call -b "$block" state | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["title"]+", "+str(d["can_go_forward"]).lower())')
+  "$rexdev" block close "$block" > /dev/null 2>&1 || true
+  if [ "$got" = "$want" ]; then echo "ok   $name"; else echo "FAIL $name: got '$got', want '$want'"; failed=1; fi
+}
+
 failed=0
 show='oninput="document.title=this.value"'
 check "each key types once, none dropped" \
@@ -34,4 +50,8 @@ check "each key types once, none dropped" \
 check "a key the page cancels types nothing" \
   "<title>-</title><input id=i $show><script>addEventListener('keydown',e=>{if(e.key=='/'&&document.activeElement!==i){e.preventDefault();i.focus()}})</script>" \
   "/crab" "crab"
+check_keys "⌘L and an address load the page" "<title>start</title>" "Example Domain, false" \
+  cmd+l type:example.com enter
+check_keys "⌘[ goes back in the page, not to another pane" "<title>start</title>" "start, true" \
+  cmd+l type:example.com enter wait cmd+[
 exit $failed

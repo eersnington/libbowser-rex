@@ -733,6 +733,11 @@ static NSString *fixup_url(NSString *typed) {
         [@[ @"about", @"data", @"mailto", @"view-source" ] containsObject:name])
       return s;
   }
+  // A path to a file on disk, such as a page someone just wrote: open it.
+  if ([s hasPrefix:@"/"] || [s hasPrefix:@"~/"]) {
+    NSString *path = s.stringByExpandingTildeInPath;
+    if ([NSFileManager.defaultManager fileExistsAtPath:path]) return [NSURL fileURLWithPath:path].absoluteString;
+  }
   if ([s rangeOfCharacterFromSet:NSCharacterSet.whitespaceCharacterSet].location == NSNotFound) {
     NSString *hostPort = [s componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/?#"]][0];
     NSString *host = [hostPort stringByReplacingOccurrencesOfString:@":[0-9]+$"

@@ -168,19 +168,19 @@ final class BowserPaneView: NSView, NSTextInputClient {
   private var cursor = NSCursor.arrow
 
   private(set) var state = BrowserState()
-  // The chrome is made on first use: building it (an NSSearchField, effect
-  // views) costs more than the rest of mounting a pane.
-  private var addressBarIfMade: AddressBar?
-  private var findBarIfMade: FindBar?
-  private var progressLineIfMade: ProgressLine?
-  private var addressBar: AddressBar {
-    if let b = addressBarIfMade { return b }
-    let b = AddressBar(send: { [weak self] in self?.send($0, $1) })
-    b.onDismiss = { [weak self, weak b] in self?.dismiss(b) }
-    addressBarIfMade = b
-    addBar(b)
-    return b
+  /// Always shown above the page.
+  private lazy var toolbar: Toolbar = {
+    let t = Toolbar(send: { [weak self] in self?.send($0, $1) })
+    t.onDone = { [weak self] in self?.window?.makeFirstResponder(self) }
+    return t
+  }()
+  /// Where the page sits: below the toolbar. Page coordinates start here.
+  var pageRect: NSRect {
+    NSRect(x: 0, y: Toolbar.height, width: bounds.width, height: max(0, bounds.height - Toolbar.height))
   }
+  // The find bar is made on first use: building it (an NSSearchField, effect
+  // views) costs more than the rest of mounting a pane.
+  private var findBarIfMade: FindBar?
   private var findBar: FindBar {
     if let b = findBarIfMade { return b }
     let b = FindBar(send: { [weak self] in self?.send($0, $1) })
@@ -188,14 +188,6 @@ final class BowserPaneView: NSView, NSTextInputClient {
     findBarIfMade = b
     addBar(b)
     return b
-  }
-  private var progressLine: ProgressLine {
-    if let l = progressLineIfMade { return l }
-    let l = ProgressLine()
-    progressLineIfMade = l
-    addSubview(l)
-    layoutChrome()
-    return l
   }
   private func addBar(_ bar: NSView) {
     bar.isHidden = true
@@ -208,6 +200,7 @@ final class BowserPaneView: NSView, NSTextInputClient {
     super.init(frame: .zero)
     PaneRects.views.add(self)
     wantsLayer = true
+    addSubview(toolbar)
     addTrackingArea(NSTrackingArea(
       rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
       owner: self))
@@ -339,14 +332,15 @@ final class BowserPaneView: NSView, NSTextInputClient {
     layoutChrome()
     PaneRects.changed()
     guard let host else { return }
-    let size = bowser_size_s(width: bounds.width, height: bounds.height, scale: Double(window?.backingScaleFactor ?? 2))
+    let page = pageRect
+    let size = bowser_size_s(width: page.width, height: page.height, scale: Double(window?.backingScaleFactor ?? 2))
     // Rex lays panes out often; only a real change reaches the engine, where a
     // resize means a page relayout.
     if let s = sentSize, s.width == size.width, s.height == size.height, s.scale == size.scale { return }
     sentSize = size
     CATransaction.begin()
     CATransaction.setDisableActions(true)
-    bowser_host_layer(host).frame = bounds
+    bowser_host_layer(host).frame = page
     CATransaction.commit()
     bowser_host_resize(host, size)
   }
@@ -356,11 +350,10 @@ final class BowserPaneView: NSView, NSTextInputClient {
 
   private func layoutChrome() {
     let inset: CGFloat = 8, height: CGFloat = 34
-    progressLineIfMade?.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 2)
-    let addressWidth = min(bounds.width - 2 * inset, 720)
-    addressBarIfMade?.frame = NSRect(x: (bounds.width - addressWidth) / 2, y: inset, width: addressWidth, height: height)
+    toolbar.frame = NSRect(x: 0, y: 0, width: bounds.width, height: Toolbar.height)
     let findWidth = min(bounds.width - 2 * inset, 380)
-    findBarIfMade?.frame = NSRect(x: bounds.width - findWidth - inset, y: inset, width: findWidth, height: height)
+    findBarIfMade?.frame = NSRect(
+      x: bounds.width - findWidth - inset, y: Toolbar.height + inset, width: findWidth, height: height)
   }
 
   private func send(_ name: String, _ body: [String: Any]?) {
@@ -378,8 +371,7 @@ final class BowserPaneView: NSView, NSTextInputClient {
     case "state":
       guard let s = BrowserState(json: body) else { return }
       state = s
-      addressBarIfMade?.update(s)
-      if s.loading || progressLineIfMade != nil { progressLine.update(loading: s.loading, progress: s.progress) }
+      toolbar.update(s)
     case "menu":
       showMenu(body)
     case "find_result":
@@ -433,7 +425,8 @@ final class BowserPaneView: NSView, NSTextInputClient {
       }
     }
     build(items, into: menu)
-    let at = NSPoint(x: o["x"] as? Double ?? 0, y: o["y"] as? Double ?? 0)  // flipped view: top-left, like the engine
+    // The engine's page coordinates: top-left, below the toolbar.
+    let at = NSPoint(x: o["x"] as? Double ?? 0, y: (o["y"] as? Double ?? 0) + pageRect.minY)
     // A <select> opens with its current item over the control, as native pop-up buttons do.
     let selected = o["selected"] as? Int ?? -1
     let positioning = o["kind"] as? String == "select" && selected >= 0 ? menu.item(withTag: selected) : nil
@@ -447,7 +440,7 @@ final class BowserPaneView: NSView, NSTextInputClient {
   private func show(_ bar: NSView) {
     bar.isHidden = false
     layoutChrome()
-    if let a = bar as? AddressBar { a.update(state); a.focus() } else if let f = bar as? FindBar { f.focus() }
+    (bar as? FindBar)?.focus()
   }
 
   private func dismiss(_ bar: NSView?) {
@@ -479,7 +472,11 @@ final class BowserPaneView: NSView, NSTextInputClient {
     // window, which a background window isn't).
     if let edit { return window.firstResponder?.tryToPerform(edit, with: self) ?? false }
     switch (mods, key) {
-    case ([.command], "l"): show(addressBar)
+    case ([.command], "l"): toolbar.edit()
+    // Rex takes ⌘[ ⌘] for pane focus (⌥⌘ arrows do it too); in a page they
+    // go back and forward, as in every browser.
+    case ([.command], "["): send("back", nil)
+    case ([.command], "]"): send("forward", nil)
     case ([.command], "r"), ([.command, .shift], "r"): send("reload", nil)
     case ([.command], "f"): show(findBar)
     case ([.command], "g"): findBarIfMade?.findNext()
@@ -532,7 +529,9 @@ final class BowserPaneView: NSView, NSTextInputClient {
 
   private func mouse(_ e: NSEvent, _ action: bowser_mouse_action_e, _ button: Int32) {
     guard let host else { return }
-    let p = convert(e.locationInWindow, from: nil)  // flipped: already top-left
+    var p = convert(e.locationInWindow, from: nil)  // flipped: already top-left
+    p.y -= pageRect.minY  // page coordinates
+    if p.y < 0, action == BOWSER_MOUSE_MOVE { return }  // over the toolbar
     var m = bowser_mouse_s(
       action: action, button: button, x: p.x, y: p.y,
       click_count: Int32(e.type == .mouseMoved ? 0 : e.clickCount), mods: UInt64(e.modifierFlags.rawValue),
@@ -552,7 +551,8 @@ final class BowserPaneView: NSView, NSTextInputClient {
   override func mouseDragged(with e: NSEvent) { mouse(e, BOWSER_MOUSE_DRAG, 0) }
   override func mouseMoved(with e: NSEvent) {
     mouse(e, BOWSER_MOUSE_MOVE, 0)
-    cursor.set()
+    // The page's cursor only over the page; the toolbar's is the arrow.
+    (convert(e.locationInWindow, from: nil).y < pageRect.minY ? NSCursor.arrow : cursor).set()
   }
   override func mouseExited(with e: NSEvent) { mouse(e, BOWSER_MOUSE_EXIT, 0) }
   override func rightMouseDown(with e: NSEvent) { mouse(e, BOWSER_MOUSE_DOWN, 1) }
@@ -560,7 +560,8 @@ final class BowserPaneView: NSView, NSTextInputClient {
 
   override func scrollWheel(with e: NSEvent) {
     guard let host else { return }
-    let p = convert(e.locationInWindow, from: nil)
+    var p = convert(e.locationInWindow, from: nil)
+    p.y -= pageRect.minY
     var s = bowser_scroll_s(
       dx: e.scrollingDeltaX, dy: e.scrollingDeltaY, precise: e.hasPreciseScrollingDeltas,
       phase: Int32(e.phase.rawValue), momentum_phase: Int32(e.momentumPhase.rawValue),
@@ -645,7 +646,7 @@ final class BowserPaneView: NSView, NSTextInputClient {
   func characterIndex(for point: NSPoint) -> Int { NSNotFound }
   func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
     let r = compositionRects.first ?? caret
-    let local = NSRect(x: r.x, y: r.y, width: max(r.width, 1), height: r.height)  // flipped view
+    let local = NSRect(x: r.x, y: r.y + pageRect.minY, width: max(r.width, 1), height: r.height)  // flipped view
     guard let window else { return .zero }
     return window.convertToScreen(convert(local, to: nil))
   }
@@ -856,7 +857,7 @@ enum PaneRects {
     var out: [String: [String: [Double]]] = [:]
     for v in views.allObjects {
       guard let w = v.window, v.superview != nil, !v.isHiddenOrHasHiddenAncestor else { continue }
-      let r = v.convert(v.bounds, to: nil)  // window coordinates, origin bottom left
+      let r = v.convert(v.pageRect, to: nil)  // the page only; window coordinates, origin bottom left
       let h = w.frame.height
       var entry = out[String(w.windowNumber)] ?? ["size": [w.frame.width, h]]
       entry[v.blockID] = [r.minX, h - r.maxY, r.width, r.height]

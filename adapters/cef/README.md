@@ -130,6 +130,7 @@ gives OSR the popup's pixels, not its items.
 | Has a scheme with `://`, or is `about:`, `data:`, `mailto:`, `view-source:` | As is |
 | One word that looks like a host (`example.com`, `example.com/a?b`) | `https://` + input |
 | `localhost` or an IP address, with an optional port | `http://` + input |
+| A path to a file that exists (`/tmp/a.html`, `~/notes.html`) | The `file://` URL |
 | Anything else (`two words`, `example`) | `https://duckduckgo.com/?q=` + input |
 
 On an error page, `state.url` is the address that failed, not the one before it.

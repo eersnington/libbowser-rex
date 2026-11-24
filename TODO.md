@@ -106,7 +106,8 @@ paint callback; CPU is `ps` CPU time over the scroll, as % of one core.
 - [ ] A page next to a pane that opens or closes stutters for a frame or more per resize (perf-load.py)
 - [ ] Rex's own pane latency (about 40 ms from block to mounted pane, and 100–200 ms of window layout) is outside libbowser
 - [x] Pane focus: a click calls Rex's `onFocus`; Rex focus gives the page the keyboard
-- [x] Native chrome: address bar (⌘L), find bar (⌘F), loading line; Edit menu keys; reload, zoom
+- [x] Native chrome: toolbar (back/forward, reload, address, loading line), find bar (⌘F); ⌘L, ⌘[ ⌘]; Edit menu keys; reload, zoom
+- [ ] Ad blocking and extensions (Helium as the engine, or a built-in filter list)
 - [ ] Back/forward gestures: two-finger swipe (mouse buttons 4/5 work)
 - [ ] Context menus (the engine suppresses them; show a native NSMenu from the host)
 - [x] One dev harness: `rex-client/run.sh` (`rex/dev-server.sh` is gone)

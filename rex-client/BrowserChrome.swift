@@ -1,6 +1,6 @@
-// The browser chrome a Rex pane shows over a page: an address bar, a find bar,
-// and a loading line. They float over the page instead of taking space from
-// it, so showing them never resizes (and never relayouts) the page.
+// The browser chrome of a Rex pane: a toolbar above the page (back, forward,
+// reload, the address, a loading line), and a find bar that floats over the
+// page, so showing it never resizes (and never relayouts) the page.
 //
 // Everything here talks to the engine through the vocabulary in
 // adapters/cef/README.md, via the `send` closure.
@@ -74,45 +74,106 @@ class FloatingBar: NSVisualEffectView {
   }
 }
 
-// MARK: - Address bar
+// MARK: - Toolbar
 
-final class AddressBar: FloatingBar, NSTextFieldDelegate {
+/// The row above the page, always shown: back and forward (only once there is
+/// somewhere to go), reload or stop, and the address. The address reads as
+/// host and path; a click or ⌘L edits the full URL, selected, and Return
+/// loads it. A loading line runs along its bottom edge.
+final class Toolbar: NSVisualEffectView, NSTextFieldDelegate {
+  static let height: CGFloat = 30
   let send: SendMessage
-  var onDismiss: () -> Void = {}
-  private let field = NSTextField()
-  private lazy var back = symbolButton("chevron.left", "Back", self, #selector(goBack))
-  private lazy var forward = symbolButton("chevron.right", "Forward", self, #selector(goForward))
-  private lazy var reload = symbolButton("arrow.clockwise", "Reload", self, #selector(reloadOrStop))
-  private var loading = false
+  /// The address was submitted or abandoned: the page takes the keyboard back.
+  var onDone: () -> Void = {}
+  private lazy var back = symbolButton("chevron.left", "Back (⌘[)", self, #selector(goBack))
+  private lazy var forward = symbolButton("chevron.right", "Forward (⌘])", self, #selector(goForward))
+  private lazy var reload = symbolButton("arrow.clockwise", "Reload (⌘R)", self, #selector(reloadOrStop))
+  private let field = AddressField()
+  private let progress = ProgressLine()
+  private let rule = NSBox()
+  private var page = BrowserState()
 
   init(send: @escaping SendMessage) {
     self.send = send
     super.init(frame: .zero)
-    field.bezelStyle = .roundedBezel
+    material = .headerView
+    blendingMode = .withinWindow
+    state = .followsWindowActiveState
+    field.isBordered = false
+    field.drawsBackground = false
+    field.focusRingType = .none
+    field.font = .systemFont(ofSize: 12)
     field.placeholderString = "Search or enter website name"
     field.delegate = self
+    field.onFocus = { [weak self] in self?.fieldDidFocus() }
     field.cell?.isScrollable = true
     field.cell?.wraps = false
     field.lineBreakMode = .byTruncatingTail
-    field.setContentHuggingPriority(.defaultLow, for: .horizontal)
-    stack([back, forward, reload, field])
+    rule.boxType = .separator
+    for v in [back, forward, reload, field, rule, progress] as [NSView] { addSubview(v) }
+    update(BrowserState())
   }
   required init?(coder: NSCoder) { fatalError() }
 
+  override func layout() {
+    super.layout()
+    let h = Toolbar.height, b: CGFloat = 24
+    var x: CGFloat = 6
+    for button in [back, forward, reload] where !button.isHidden {
+      button.frame = NSRect(x: x, y: (h - b) / 2, width: b, height: b)
+      x += b + 2
+    }
+    let fieldHeight = field.intrinsicContentSize.height
+    field.frame = NSRect(x: x + 6, y: (h - fieldHeight) / 2, width: max(0, bounds.width - x - 18), height: fieldHeight)
+    rule.frame = NSRect(x: 0, y: h - 1, width: bounds.width, height: 1)
+    progress.frame = NSRect(x: 0, y: h - 2, width: bounds.width, height: 2)
+  }
+  override var isFlipped: Bool { true }
+
   func update(_ s: BrowserState) {
+    page = s
+    // Like terminal-browser: no arrows until there is history to walk.
+    let history = s.canGoBack || s.canGoForward
+    if back.isHidden == history {
+      back.isHidden = !history
+      forward.isHidden = !history
+      needsLayout = true
+    }
     back.isEnabled = s.canGoBack
     forward.isEnabled = s.canGoForward
-    loading = s.loading
     reload.image = NSImage(systemSymbolName: s.loading ? "xmark" : "arrow.clockwise",
                            accessibilityDescription: s.loading ? "Stop" : "Reload")
-    // Don't overwrite what the user is typing.
-    if field.currentEditor() == nil { field.stringValue = s.url }
+    reload.toolTip = s.loading ? "Stop" : "Reload (⌘R)"
+    if !editing { show() }
+    progress.update(loading: s.loading, progress: s.progress)
   }
 
-  /// Show the full address, selected, ready to type over (⌘L).
-  func focus() {
+  private var editing: Bool { field.currentEditor() != nil }
+
+  /// The address as people read it: no scheme, no trailing slash.
+  private func show() {
+    var u = page.url
+    for scheme in ["https://", "http://", "file://"] where u.hasPrefix(scheme) {
+      u.removeFirst(scheme.count)
+    }
+    if u.hasSuffix("/") { u.removeLast() }
+    if let home = ProcessInfo.processInfo.environment["HOME"], u.hasPrefix(home) { u = "~" + u.dropFirst(home.count) }
+    field.stringValue = u
+    field.textColor = .secondaryLabelColor
+  }
+
+  /// ⌘L: the full address, selected, ready to type over.
+  func edit() {
     window?.makeFirstResponder(field)
-    field.currentEditor()?.selectAll(nil)
+  }
+
+  /// The first click or ⌘L: the full URL in place of the short one, all
+  /// selected, as browsers do.
+  private func fieldDidFocus() {
+    guard let editor = field.currentEditor() else { return }
+    field.stringValue = page.url
+    field.textColor = .labelColor
+    editor.selectAll(nil)
   }
 
   func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
@@ -120,19 +181,37 @@ final class AddressBar: FloatingBar, NSTextFieldDelegate {
     case #selector(NSResponder.insertNewline(_:)):
       let typed = field.stringValue.trimmingCharacters(in: .whitespaces)
       if !typed.isEmpty { send("navigate", ["url": typed]) }
-      onDismiss()
+      finish()
       return true
     case #selector(NSResponder.cancelOperation(_:)):
-      onDismiss()
+      finish()
       return true
     default:
       return false
     }
   }
 
+  func controlTextDidEndEditing(_ obj: Notification) { show() }
+
+  private func finish() {
+    onDone()
+    show()
+  }
+
   @objc private func goBack() { send("back", nil) }
   @objc private func goForward() { send("forward", nil) }
-  @objc private func reloadOrStop() { send(loading ? "stop" : "reload", nil) }
+  @objc private func reloadOrStop() { send(page.loading ? "stop" : "reload", nil) }
+}
+
+/// A text field that says when it takes the keyboard. After the click that
+/// focused it is handled, so selecting all isn't undone by the click.
+final class AddressField: NSTextField {
+  var onFocus: () -> Void = {}
+  override func becomeFirstResponder() -> Bool {
+    let took = super.becomeFirstResponder()
+    if took { DispatchQueue.main.async { [weak self] in self?.onFocus() } }
+    return took
+  }
 }
 
 // MARK: - Find bar
@@ -203,7 +282,7 @@ final class FindBar: FloatingBar, NSSearchFieldDelegate {
 
 // MARK: - Loading line
 
-/// A 2 pt line along the top edge while a page loads, like Safari's.
+/// A 2 pt line while a page loads, like Safari's.
 final class ProgressLine: NSView {
   private let bar = CALayer()
   private var visible = false
