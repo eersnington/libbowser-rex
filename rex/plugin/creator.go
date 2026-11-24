@@ -60,10 +60,10 @@ var creatorList = map[string]any{
 					}, "trace_us", "mach_us"),
 				},
 				"trace_stop": map[string]any{
-					"description": "Stop the trace. The engine writes it to path; the file appears when it is complete.",
+					"description": "Stop the trace. The engine writes it to path; the file appears when it is complete. Without path, the trace is thrown away.",
 					"input_schema": obj(map[string]any{
 						"path": map[string]any{"type": "string", "description": "An absolute path for the JSON trace."},
-					}, "path"),
+					}),
 				},
 			},
 			"events": map[string]any{

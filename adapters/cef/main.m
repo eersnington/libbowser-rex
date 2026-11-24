@@ -1646,6 +1646,12 @@ static NSDictionary *trace_command(NSString *name, NSDictionary *cmd) {
     return @{@"trace_us" : @(cef_now_from_system_trace_time()), @"mach_us" : @(mach_us)};
   }
   id path = cmd[@"path"];
+  if (!path) {
+    // No path: throw the trace away. A recorder restarts it this way so
+    // Chromium's buffer, which stops when full, never fills.
+    if (E.tracePath) return @{@"error" : @"a trace is still being written"};
+    return cef_end_tracing(NULL, NULL) ? @{} : @{@"error" : @"tracing is off"};
+  }
   if (![path isKindOfClass:NSString.class] || ![path isAbsolutePath]) return @{@"error" : @"trace_stop needs an absolute path"};
   NSString *tmp = [path stringByAppendingString:@".part"];
   cef_string_t f = cef_str([tmp UTF8String]);

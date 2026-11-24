@@ -2,6 +2,8 @@
 //
 //   sysmon <seconds> <out.jsonl> <rex client pid> <engine pid>
 //
+// With 0 seconds it runs until killed; with "-" as the file it prints each
+// line as it samples.
 // GPU time per process comes from the IOKit accelerator user clients (what
 // Activity Monitor's GPU column reads); CPU from proc_pid_rusage and the
 // kernel's per-core ticks. Other apps appear only as one total, never by name.
@@ -108,7 +110,10 @@ let windowServer: pid_t = {
 var lines = [#"{"name":"process_name","ph":"M","pid":2,"args":{"name":"Mac load (sysmon)"}}"#]
 var prevT = nowUs(), prevGPU = gpuTimes(), prevMachine = machineTicks()
 var prevCPU = Dictionary(uniqueKeysWithValues: ([engine, rex] + engineKids).map { ($0, cpuUs($0)) })
-let end = prevT + secs * 1e6
+setvbuf(stdout, nil, _IOLBF, 0)
+let stream = args[2] == "-"
+if stream { print(lines[0]) }
+let end = secs > 0 ? prevT + secs * 1e6 : .infinity
 while nowUs() < end {
   usleep(50_000)
   let t = nowUs(), gpu = gpuTimes(), machine = machineTicks()
@@ -137,11 +142,12 @@ while nowUs() < end {
     let data = try! JSONSerialization.data(withJSONObject: [
       "name": name, "ph": "C", "pid": 2, "tid": 1, "ts": prevT, "args": values.mapValues { ($0 * 10).rounded() / 10 },
     ])
-    lines.append(String(decoding: data, as: UTF8.self))
+    let line = String(decoding: data, as: UTF8.self)
+    if stream { print(line) } else { lines.append(line) }
   }
   prevT = t
   prevGPU = gpu
   prevMachine = machine
   prevCPU = cpuNow
 }
-try lines.joined(separator: "\n").appending("\n").write(toFile: args[2], atomically: true, encoding: .utf8)
+if !stream { try lines.joined(separator: "\n").appending("\n").write(toFile: args[2], atomically: true, encoding: .utf8) }

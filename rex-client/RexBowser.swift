@@ -697,6 +697,14 @@ private func keyboardPane(in window: NSWindow) -> BowserPaneView? {
 /// From the NSApplication.sendEvent hook: true when a browser pane took the key.
 @_cdecl("rex_bowser_handle_key")
 public func rexBowserHandleKey(_ event: NSEvent) -> Bool {
+  // ⌃⌥⌘J: "I just saw a stutter". perf-watch saves the seconds before it.
+  if event.type == .keyDown, Perf.file != nil, event.charactersIgnoringModifiers?.lowercased() == "j",
+    event.modifierFlags.intersection([.control, .option, .command, .shift]) == [.control, .option, .command]
+  {
+    Perf.instant(Perf.markName)
+    NSSound.beep()
+    return true
+  }
   guard event.type == .keyDown, event.modifierFlags.contains(.command),
     let window = event.window ?? NSApp.keyWindow, let pane = keyboardPane(in: window)
   else { return false }
@@ -757,6 +765,10 @@ enum Perf {
     return f
   }()
   static let queue = DispatchQueue(label: "perf", qos: .utility)
+  static let markName = "stutter marked"
+  /// The log starts over past this size; perf-watch keeps what it needs.
+  static let cap: UInt64 = 16 << 20
+  static var header: [[String: Any]] = []
   static let pid = ProcessInfo.processInfo.processIdentifier
   static let timebase: Double = {
     var tb = mach_timebase_info()
@@ -772,9 +784,17 @@ enum Perf {
     e["pid"] = pid
     e["tid"] = pthread_main_np() != 0 ? 1 : 2
     queue.async {
-      guard let data = try? JSONSerialization.data(withJSONObject: e) else { return }
-      file.write(data + Data("\n".utf8))
+      if e["ph"] as? String == "M" { header.append(e) }
+      if file.offsetInFile > cap {
+        file.truncateFile(atOffset: 0)
+        for h in header { file.write(line(h)) }
+      }
+      file.write(line(e))
     }
+  }
+
+  private static func line(_ e: [String: Any]) -> Data {
+    ((try? JSONSerialization.data(withJSONObject: e)) ?? Data()) + Data("\n".utf8)
   }
 
   /// A slice from `start` to now, if it took at least `over` microseconds.

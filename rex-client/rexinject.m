@@ -194,7 +194,7 @@ static void dump_all(void) {
 // ---- Synthetic keys (dev hook) ---------------------------------------------
 // SIGINFO: send each line of BOWSER_REX_KEYS through NSApp.sendEvent, the same
 // path real keys take (key equivalents, menus, the responder chain).
-// Lines: "cmd+l", "cmd+shift+g", "enter", "esc", "tab", "type:some text".
+// Lines: "cmd+l", "cmd+shift+g", "ctrl+opt+cmd+j", "enter", "esc", "tab", "type:some text".
 
 static void send_key(NSWindow *w, NSString *chars, unsigned short code, NSEventModifierFlags mods) {
   NSEventType types[] = {NSEventTypeKeyDown, NSEventTypeKeyUp};
@@ -248,6 +248,7 @@ static void play_keys(void) {
         if ([p isEqualToString:@"cmd"]) mods |= NSEventModifierFlagCommand;
         if ([p isEqualToString:@"shift"]) mods |= NSEventModifierFlagShift;
         if ([p isEqualToString:@"opt"]) mods |= NSEventModifierFlagOption;
+        if ([p isEqualToString:@"ctrl"]) mods |= NSEventModifierFlagControl;
       }
       NSString *k = parts.lastObject;
       send_key(w, k, [codes[k] unsignedShortValue], mods);
