@@ -103,6 +103,9 @@ typedef int CGSConnectionID;
 CGSConnectionID CGSMainConnectionID(void);
 CFArrayRef CGSCopyManagedDisplaySpaces(CGSConnectionID);
 void CGSAddWindowsToSpaces(CGSConnectionID, CFArrayRef windows, CFArrayRef spaces);
+void CGSRemoveWindowsFromSpaces(CGSConnectionID, CFArrayRef windows, CFArrayRef spaces);
+
+static NSArray<NSNumber *> *other_spaces; // every Space but the target
 
 static NSNumber *target_space(void) {
   static NSNumber *space;
@@ -115,6 +118,10 @@ static NSNumber *target_space(void) {
     for (NSDictionary *d in displays) [spaces addObjectsFromArray:d[@"Spaces"]];
     long i = atol(want);
     if (i >= 1 && i <= (long)spaces.count) space = spaces[i - 1][@"ManagedSpaceID"];
+    NSMutableArray *others = [NSMutableArray new];
+    for (NSDictionary *sp in spaces)
+      if (![sp[@"ManagedSpaceID"] isEqual:space]) [others addObject:sp[@"ManagedSpaceID"]];
+    other_spaces = others;
   });
   return space;
 }
@@ -127,9 +134,15 @@ static void swizzle(Class c, SEL sel, IMP imp, IMP *original) {
 static IMP orig_orderWindow;
 static void bowser_orderWindow(NSWindow *self, SEL _cmd, NSWindowOrderingMode mode, NSInteger other) {
   NSNumber *space = target_space();
-  if (space && mode != NSWindowOut && self.windowNumber > 0)
-    CGSAddWindowsToSpaces(CGSMainConnectionID(), (__bridge CFArrayRef) @[ @(self.windowNumber) ],
-                          (__bridge CFArrayRef) @[ space ]);
+  if (space && mode != NSWindowOut && self.windowNumber > 0) {
+    // Only on the target: a window made on the Space you look at stays
+    // there too unless it is taken off.
+    CFArrayRef w = (__bridge CFArrayRef) @[ @(self.windowNumber) ];
+    self.collectionBehavior &= ~(NSWindowCollectionBehaviorMoveToActiveSpace | NSWindowCollectionBehaviorCanJoinAllSpaces);
+    CGSAddWindowsToSpaces(CGSMainConnectionID(), w, (__bridge CFArrayRef) @[ space ]);
+    CGSRemoveWindowsFromSpaces(CGSMainConnectionID(), w, (__bridge CFArrayRef)other_spaces);
+    trace("window %ld: Space %s only", (long)self.windowNumber, getenv("BOWSER_SPACE"));
+  }
   ((void (*)(id, SEL, NSWindowOrderingMode, NSInteger))orig_orderWindow)(self, _cmd, mode, other);
 }
 
@@ -140,9 +153,11 @@ static void bowser_sendEvent(NSApplication *self, SEL _cmd, NSEvent *event) {
   ((void (*)(id, SEL, NSEvent *))orig_sendEvent)(self, _cmd, event);
 }
 
-static IMP orig_activate, orig_activateIgnoring;
+static IMP orig_activate, orig_activateIgnoring, orig_runningActivate, orig_activateFrom;
 static void bowser_noop(id self, SEL _cmd) {}
 static void bowser_noop_bool(id self, SEL _cmd, BOOL flag) {}
+static BOOL bowser_no_activation(id self, SEL _cmd, NSUInteger options) { return NO; }
+static BOOL bowser_no_activation_from(id self, SEL _cmd, id from, NSUInteger options) { return NO; }
 
 // ---- View tree dump --------------------------------------------------------
 
@@ -278,6 +293,12 @@ __attribute__((constructor)) static void bowser_rex_init(void) {
     swizzle(NSApplication.class, @selector(activate), (IMP)bowser_noop, &orig_activate);
     swizzle(NSApplication.class, @selector(activateIgnoringOtherApps:), (IMP)bowser_noop_bool,
             &orig_activateIgnoring);
+    // Newer Rex activates through NSRunningApplication; only this process
+    // uses it here, so no app is ever brought to the front.
+    swizzle(NSRunningApplication.class, @selector(activateWithOptions:), (IMP)bowser_no_activation,
+            &orig_runningActivate);
+    swizzle(NSRunningApplication.class, @selector(activateFromApplication:options:), (IMP)bowser_no_activation_from,
+            &orig_activateFrom);
   }
   // SIGUSR2: ask the app to open its window as if its Dock icon was clicked,
   // without activating it.
