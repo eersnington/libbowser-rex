@@ -57,13 +57,18 @@ server)
   # The dev.libbowser block plugin (rex/plugin), discovered from --block-dir.
   mkdir -p "$dev/blocks" "$dev/logs"
   (cd "$here/../rex/plugin" && go build -o "$dev/blocks/rexplugin" .)
+  # bowser, the CLI that drives browser panes, for the dev server's shells.
+  mkdir -p "$dev/bin"
+  (cd "$here/../rex/bowser" && go build -o "$dev/bin/bowser" .)
   make -s -C "$here/.." cef
   # The server is isolated by its fake HOME (Go reads $HOME for every path
   # it keeps, and so does the engine for its profile), not by sandbox.sb:
   # Chromium's own sandbox can't start inside another one, and neither can
   # the setuid /usr/bin/login that shells use. REX_* from a shell inside the
   # user's Rex name the real server; the plugin and its shells must not see them.
-  env -u REX_SERVER -u REX_SESSION -u REX_BLOCK -u REX_CLIENT \
+  # Its shells get the dev server's REX_SERVER instead: without it, rex in a
+  # dev pane reaches the user's own server.
+  env -u REX_SESSION -u REX_BLOCK -u REX_CLIENT REX_SERVER="unix://$dev/s.sock" PATH="$dev/bin:$PATH" \
     HOME="$dev/home" REX_CONFIG="$dev/init.lua" REXPLUGIN_LOG="$dev/logs/plugin.log" BOWSER_TICKET_SOCKET="$dev/tickets.sock" \
     BOWSER_ENGINE="${BOWSER_ENGINE:-$here/../build/bowser-cef.app/Contents/MacOS/bowser-cef}" "$srv" server run \
     --listen "unix://$dev/s.sock" --state-dir "$dev/state" --config "$dev/init.lua" --restore=false \

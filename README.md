@@ -22,6 +22,7 @@ make && make cef
 make test              # core, real processes
 make test-cef          # the engine
 make test-rex          # the Rex plugin with the real engine
+rex-client/check-bowser.sh   # bowser in a real Rex pane
 ```
 
 ## Use in Rex
@@ -33,6 +34,14 @@ rex-client/dev/rexdev do browser url=news.ycombinator.com
 ```
 
 ⇧⌘B in a pane asks for an address. ⌘L, ⌘F, ⌘R, and zoom work in the page.
+Links that open a window open a pane beside it.
+
+Agents in Rex panes drive the page with `bowser` (see `rex/README.md`):
+
+```sh
+bowser open localhost:3000 --split right
+bowser snapshot -i && bowser click e3
+```
 
 ## Numbers
 
@@ -52,7 +61,7 @@ M4 MacBook Air, 60 Hz. Details in [docs/perf.md](docs/perf.md).
 | `src/` | Control socket, IOSurface frames over Mach, producer and host |
 | `adapters/cef/` | `bowser-cef`: one Chromium engine for many panes |
 | `adapters/test/` | A test producer |
-| `rex/` | The Rex block plugin, the `browser` action, the observed plugin protocol |
+| `rex/` | The Rex block plugin, the `bowser` CLI, the `browser` action, the observed plugin protocol |
 | `rex-client/` | The pane view and the dev Rex client harness |
 | `examples/host-swift/` | A minimal AppKit host |
 | `tests/` | End-to-end tests |

@@ -57,6 +57,7 @@ type block struct {
 	// for the engine; refilled after each use. Empty when there is none.
 	spare        string
 	spareExpires time.Time
+	refs         map[string]int64 // the newest snapshot's refs: name → DOM backend node
 }
 
 // Tickets live 60 s in the engine; a spare is used well inside that.
@@ -258,6 +259,15 @@ func (p *plugin) onEngineEvent(e *engine, ev engineEvent) {
 			name = "host_attached"
 		}
 		p.emit(b.id, name, map[string]any{})
+	case "popup":
+		var foreground bool
+		json.Unmarshal(ev["foreground"], &foreground)
+		go p.openPane(b, ev.str("url"), foreground)
+	case "send_to_agent":
+		var x, y float64
+		json.Unmarshal(ev["x"], &x)
+		json.Unmarshal(ev["y"], &y)
+		go p.sendToAgent(b, x, y, ev.str("selection"))
 	case "closed":
 		b.mu.Lock()
 		b.eng, b.surface = nil, ""
@@ -419,6 +429,8 @@ func (p *plugin) method(raw json.RawMessage) (any, *rpcError) {
 		}
 		delete(r, "id")
 		return r, nil
+	case actionMethods[in.Method]:
+		return p.action(b, in.Method, in.Args)
 	case plainMessages[in.Method]:
 		if err := decodeStrict(in.Args, &struct{}{}); err != nil {
 			return nil, errBadRequest(in.Method + " args: " + err.Error())

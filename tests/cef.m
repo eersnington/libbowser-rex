@@ -927,6 +927,57 @@ static void remove_profiles(void) {
   for (NSString *path in profiles) [NSFileManager.defaultManager removeItemAtPath:path error:nil];
 }
 
+// The browser is part of its host app: a link that opens a window asks the
+// controller for a new pane (a page alone can't), and Send to Agent hands
+// the controller what was right-clicked. The page stays where it was.
+static void test_new_windows_and_send_to_agent_reach_the_controller(void) {
+  Engine *e = start_engine();
+  NSString *sid = [e open:data_url(@"<title>Links</title><body style='margin:0'>"
+                                    "<a target=_blank href='https://example.com/new' "
+                                    "style='display:block;width:200px;height:40px'>New</a>"
+                                    "<script>setTimeout(() => { open('https://example.com/spam'); document.title = 'Tried' }, 200)"
+                                    "</script>")
+                transport:kWindowed];
+  CHECK([e state:sid where:^BOOL(NSDictionary *s) { return titled(s, @"Tried"); }], "the page loaded and tried a popup");
+  Host *h = attach_windowed(e, sid);
+  bowser_host_focus(h.handle, true);
+  BOOL (^popup)(NSDictionary *) = ^BOOL(NSDictionary *ev) {
+    return [ev[@"event"] isEqual:@"popup"] && [ev[@"surface"] isEqual:sid];
+  };
+
+  click_button(h, 50, 20, 0);
+  NSDictionary *ev = [e wait:popup within:5];
+  CHECK([ev[@"url"] isEqual:@"https://example.com/new"] && [ev[@"foreground"] boolValue],
+        "clicking a target=_blank link asks for a new pane, in front: %s", ev.description.UTF8String);
+  for (NSDictionary *seen in e.log)
+    CHECK(![seen[@"url"] hasSuffix:@"/spam"], "a popup the page opened on its own is blocked: %s",
+          seen.description.UTF8String);
+  NSDictionary *href = [e call:@{@"cmd" : @"cdp", @"surface" : sid, @"method" : @"Runtime.evaluate",
+                                 @"params" : @{@"expression" : @"location.protocol", @"returnByValue" : @YES}}];
+  CHECK([href[@"result"][@"result"][@"value"] isEqual:@"data:"], "and the page stays: %s", href.description.UTF8String);
+
+  NSUInteger mark = h.messages.count;
+  click_button(h, 50, 20, 1);
+  NSDictionary *menu = wait_menu(h, mark);
+  int send = index_of(menu, @"Send to Agent"), pane = index_of(menu, @"Open Link in New Pane");
+  CHECK(send >= 0 && pane >= 0, "a link's menu can send it to the agent or open it in a new pane: %s",
+        menu.description.UTF8String);
+  answer(h, menu, send);
+  ev = [e wait:^BOOL(NSDictionary *x) { return [x[@"event"] isEqual:@"send_to_agent"]; } within:5];
+  CHECK(fabs([ev[@"x"] doubleValue] - 50) < 2 && fabs([ev[@"y"] doubleValue] - 20) < 2,
+        "Send to Agent tells the controller where the click was: %s", ev.description.UTF8String);
+
+  mark = h.messages.count;
+  click_button(h, 50, 20, 1);
+  menu = wait_menu(h, mark);
+  answer(h, menu, index_of(menu, @"Open Link in New Pane"));
+  ev = [e wait:popup within:5];
+  CHECK([ev[@"url"] isEqual:@"https://example.com/new"], "Open Link in New Pane asks for one: %s",
+        ev.description.UTF8String);
+  detach(h);
+  [e.proc stop];
+}
+
 int main(void) {
   @autoreleasepool {
     test_case tests[] = {
@@ -955,6 +1006,7 @@ int main(void) {
         {"windowed: a date picker takes clicks", test_windowed_date_picker_takes_clicks},
         {"windowed: a drag out of the page ends at once", test_windowed_drag_ends_at_once},
         {"windowed: real hosts show their own pages", test_windowed_hosts_show_their_own_pages},
+        {"new windows and Send to Agent reach the controller", test_new_windows_and_send_to_agent_reach_the_controller},
     };
     atexit(remove_profiles);
     return run_tests(tests, sizeof tests / sizeof *tests);

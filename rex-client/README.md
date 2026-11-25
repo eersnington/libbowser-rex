@@ -101,6 +101,8 @@ keyboard is in a browser pane:
 | ⌘[ ⌘] | Back and forward. Rex binds them to pane focus; ⌥⌘ + arrows still move between panes. |
 | Everything else | Rex, unchanged |
 
+The right-click menu has Open Link in New Pane and Send to Agent, which
+pastes what you clicked into the agent beside the pane (`rex/README.md`).
 Mouse buttons 4 and 5 go back and forward too. A click on the address, or
 ⌘L, shows the full URL selected; Return loads what you typed (a URL, a host, a
 file path, or a search), and Escape returns the keyboard to the page. A click in the page focuses the pane

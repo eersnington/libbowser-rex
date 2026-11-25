@@ -48,6 +48,8 @@ type fakeRex struct {
 	events  chan map[string]any // block_event payloads
 	queue   []map[string]any    // received, not yet matched
 	labels  []map[string]string // set_block_label calls, in order
+	splits  []map[string]any    // session.new_split calls, in order
+	refuse  bool                // refuse new splits, as a server with no room would
 }
 
 func startRex(t *testing.T) *fakeRex {
@@ -165,6 +167,17 @@ func (r *fakeRex) serveServer(w http.ResponseWriter, req *http.Request) {
 			r.mu.Lock()
 			r.labels = append(r.labels, in)
 			r.mu.Unlock()
+		case m.Method == "session.new_split" && attached[in["session_id"]]:
+			var split map[string]any
+			json.Unmarshal(m.Payload, &split)
+			r.mu.Lock()
+			r.splits = append(r.splits, split)
+			refuse := r.refuse
+			r.mu.Unlock()
+			resp.Payload = json.RawMessage(`{"block_ids":["block:new"]}`)
+			if refuse {
+				resp.Payload, resp.Error = nil, &rpcError{"conflict", "no room", 409}
+			}
 		default: // what the real server says
 			resp.Payload = nil
 			resp.Error = &rpcError{"bad_request", "stream is not attached to session " + in["session_id"], 400}
@@ -447,4 +460,133 @@ func TestTraceRecordsThePagesFramesOnTheReportedClock(t *testing.T) {
 		}
 	}
 	r.method(b, "trace_stop", nil)
+}
+
+// An agent drives a page through block methods alone: it reads the page as
+// a snapshot, acts on the snapshot's refs, and sees what a person would.
+func TestAnAgentDrivesThePageFromItsSnapshot(t *testing.T) {
+	r := startRex(t)
+	form := "data:text/html," + url.PathEscape(`<title>Form</title>`+
+		`<label>Name <input id=who></label> <button onclick="document.title='Saved '+who.value">Save</button>`+
+		`<p style="margin-top:3000px"><a href="#" onclick="document.title='Far'">Far down</a></p>`)
+	otherPage := "data:text/html," + url.PathEscape(`<title>Other</title><a href="#">One</a> <a href="#">Two</a>`+
+		`<input id=who value=kept> <button>Three</button>`)
+	a := r.createWith("block:a", map[string]any{"url": form, "transport": "calayerhost"})
+	other := r.createWith("block:b", map[string]any{"url": otherPage, "transport": "calayerhost"})
+	r.event(a, "state", titled("Form"))
+	r.event(other, "state", titled("Other"))
+
+	snap, err := r.method(a, "snapshot", nil)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	text := snap["snapshot"].(string)
+	ref := func(line string) string {
+		for _, l := range strings.Split(text, "\n") {
+			if strings.Contains(l, line) {
+				if i := strings.Index(l, "[ref="); i >= 0 {
+					return l[i+5 : i+5+strings.Index(l[i+5:], "]")]
+				}
+			}
+		}
+		t.Fatalf("the snapshot has a ref for %s:\n%s", line, text)
+		return ""
+	}
+	name, save, far := ref(`textbox "Name"`), ref(`button "Save"`), ref(`link "Far down"`)
+
+	// Each block keeps its own refs: another block's snapshot changes none of a's.
+	if _, err := r.method(other, "snapshot", nil); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if _, err := r.method(a, "fill", map[string]any{"target": name, "text": "Ribbet"}); err != nil {
+		t.Fatalf("fill: %v", err)
+	}
+	if _, err := r.method(a, "click", map[string]any{"target": save}); err != nil {
+		t.Fatalf("click: %v", err)
+	}
+	r.event(a, "state", titled("Saved Ribbet"))
+	// Off screen: click scrolls it into view first, and the link works.
+	if _, err := r.method(a, "click", map[string]any{"target": far}); err != nil {
+		t.Fatalf("click off screen: %v", err)
+	}
+	r.event(a, "state", titled("Far"))
+	if v, err := r.method(other, "eval", map[string]any{"js": "document.title + ' ' + who.value"}); err != nil ||
+		v["value"] != "Other kept" {
+		t.Fatalf("the other block's page is untouched: %v %v", v, err)
+	}
+
+	// Typed keys reach the page as a person's do: Enter submits a search box.
+	r.method(a, "eval", map[string]any{"js": `document.body.innerHTML = "<form onsubmit='document.title = \"Sent \" + q.value; return false'><input id=q></form>"; q.focus()`})
+	if _, err := r.method(a, "type", map[string]any{"text": "hop\n"}); err != nil {
+		t.Fatalf("type: %v", err)
+	}
+	r.event(a, "state", titled("Sent hop"))
+
+	// Failures say what went wrong.
+	for _, c := range []struct {
+		method string
+		args   map[string]any
+		want   string
+	}{
+		{"click", map[string]any{"target": "#missing"}, "no element matches"},
+		{"eval", map[string]any{"js": "nope()"}, "nope is not defined"},
+		{"cdp", map[string]any{"method": "Nope.nope"}, "Nope.nope"},
+	} {
+		if _, err := r.method(a, c.method, c.args); err == nil || !strings.Contains(err.Message, c.want) {
+			t.Errorf("%s %v: want an error with %q, got %v", c.method, c.args, c.want, err)
+		}
+	}
+	r.method(a, "navigate", map[string]any{"url": page("Elsewhere")})
+	r.event(a, "state", titled("Elsewhere"))
+	if _, err := r.method(a, "click", map[string]any{"target": save}); err == nil ||
+		!strings.Contains(err.Message, "snapshot") {
+		t.Fatalf("a ref to a page that's gone asks for a new snapshot, got %v", err)
+	}
+
+	shot := filepath.Join(t.TempDir(), "page.png")
+	if _, err := r.method(a, "screenshot", map[string]any{"path": shot}); err != nil {
+		t.Fatalf("screenshot: %v", err)
+	}
+	if png, _ := os.ReadFile(shot); len(png) < 100 || string(png[1:4]) != "PNG" {
+		t.Fatalf("screenshot writes a PNG, got %d bytes", len(png))
+	}
+}
+
+// A link that opens a window opens a Rex pane beside the browser's. When Rex
+// can't make one, the link opens in the browser's own pane.
+func TestNewWindowLinksOpenRexPanes(t *testing.T) {
+	r := startRex(t)
+	target := page("New")
+	links := "data:text/html," + url.PathEscape(`<title>Links</title><a id=go target=_blank href="`+target+`">Go</a>`)
+	b := r.createWith("block:a", map[string]any{"url": links, "transport": "calayerhost"})
+	r.event(b, "state", titled("Links"))
+
+	if _, err := r.method(b, "click", map[string]any{"target": "#go"}); err != nil {
+		t.Fatalf("click: %v", err)
+	}
+	var split map[string]any
+	for deadline := time.Now().Add(10 * time.Second); split == nil; time.Sleep(50 * time.Millisecond) {
+		r.mu.Lock()
+		if len(r.splits) > 0 {
+			split = r.splits[0]
+		}
+		r.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("the link asks Rex for a new pane")
+		}
+	}
+	layout, _ := json.Marshal(split["layout"])
+	if split["anchor_id"] != "block:a" || split["focus"] != true || !strings.Contains(string(layout), flavorName) ||
+		!strings.Contains(string(layout), `"url":"`+target+`"`) {
+		t.Fatalf("a browser pane with the link's page, beside block:a, in front: %v", split)
+	}
+	if v, _ := r.method(b, "eval", map[string]any{"js": "document.title"}); v["value"] != "Links" {
+		t.Fatalf("the browser's own pane stays on its page, got %v", v)
+	}
+
+	r.mu.Lock()
+	r.refuse = true
+	r.mu.Unlock()
+	r.method(b, "click", map[string]any{"target": "#go"})
+	r.event(b, "state", titled("New"))
 }

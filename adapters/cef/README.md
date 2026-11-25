@@ -40,6 +40,7 @@ the same `id`. A failed command replies `{"id":…,"error":"…"}`.
 | `{"id":3,"cmd":"close","surface":"1"}` | `{"id":3}`. The surface's host gets `detached_cb(BOWSER_ERR_DISCONNECTED)`. |
 | `{"id":4,"cmd":"message","surface":"1","name":"navigate","body":{"url":"…"}}` | `{"id":4}`. Any message from the vocabulary below. |
 | `{"id":5,"cmd":"trace_start","categories":"…"}` | `{"id":5,"trace_us":…,"mach_us":…}`. Starts Chromium's trace of every engine process. `categories` defaults to a frame-timing set. The trace's clock is mach time in µs: the two values match. |
+| `{"id":7,"cmd":"cdp","surface":"1","method":"Runtime.evaluate","params":{…}}` | `{"id":7,"result":{…}}`: one Chrome DevTools Protocol method, run in the tab's own process; no debugging port is open. It answers when Chromium does, after later commands may have had theirs. A failed method's `error` is the protocol's message. Events of the protocol are dropped. |
 | `{"id":6,"cmd":"trace_stop","path":"/abs/trace.json"}` | `{"id":6}`. The file appears at `path` once every process has sent its events. With no `path`, the trace is thrown away: Chromium's buffer stops recording when full (about 640 MB, 2 minutes of one busy tab), so a long-running recorder restarts it this way. |
 
 Events have no `id`:
@@ -51,6 +52,8 @@ Events have no `id`:
 | `{"event":"find_result","surface":"1",…}` | The `find_result` message below. |
 | `{"event":"attached","surface":"1","attached":true}` | A host attached or detached. |
 | `{"event":"closed","surface":"1"}` | The page closed itself. The surface is gone. |
+| `{"event":"popup","surface":"1","url":"…","foreground":true}` | A click opened a new window (`target=_blank`, `window.open`), or the context menu's Open Link in New Pane. The tab stays; the controller opens `url` somewhere. `foreground` is false for a background tab (⌘-click). |
+| `{"event":"send_to_agent","surface":"1","x":…,"y":…,"selection":"…"}` | The context menu's Send to Agent: where the right click was, in view points, and the selected text. |
 
 ## Browser messages
 
@@ -143,8 +146,10 @@ On an error page, `state.url` is the address that failed, not the one before it.
   `menu`; other popup widgets (date pickers, `<datalist>`) are Chromium windows
   that never come on screen; their layers are mirrored over the page, and
   input over them goes to them. Either way a popup stays inside the view.
-- **New windows.** Links with `target=_blank` and `window.open` load in the
-  same tab. The vocabulary has no "new tab" message yet.
+- **New windows.** With a controller, links with `target=_blank` and
+  `window.open` from a click become a `popup` event, and the tab stays. In
+  one-tab mode they load in the same tab. Chromium's popup blocker drops
+  windows a page opens on its own.
 - **Hidden tabs.** A tab with no host is hidden: Chromium stops painting it
   and throttles it. An OSR tab keeps only its newest frame.
 - **Displays.** A windowed tab paces frames to the display its host reports

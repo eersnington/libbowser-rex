@@ -57,6 +57,9 @@
   NSString *findText;
   int findCount, findActive;
 
+  // DevTools protocol: the observer that hands results back (cdp command)
+  cef_registration_t *devtools;
+
   // Stats, printed every 2 s while frames arrive
   CFTimeInterval windowStart, lastPaint, resizeAt;
   int frames, late;

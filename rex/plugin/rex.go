@@ -1,7 +1,8 @@
 package main
 
 // A client of the Rex server that started us, on the same rex.control.v1
-// channel the CLI uses. It only relabels blocks.
+// channel the CLI uses: it relabels blocks, opens panes, and pastes into
+// terminals (panes.go).
 //
 // We find the server through its runtime.json and talk to it only if the
 // socket's peer is our parent process. A plugin inherits REX_SERVER from
@@ -81,33 +82,58 @@ func relabel(req labelRequest) error {
 	}
 	defer ws.Close()
 	attach, _ := json.Marshal(map[string]string{"session_id": req.session})
-	if err := call(ws, "bowser-1", "session.attach", attach); err != nil {
+	if _, err := call(ws, "bowser-1", "session.attach", attach); err != nil {
 		return err
 	}
 	label, _ := json.Marshal(map[string]string{"session_id": req.session, "block_id": req.block, "label": req.label})
-	return call(ws, "bowser-2", "session.set_block_label", label)
+	_, err = call(ws, "bowser-2", "session.set_block_label", label)
+	return err
 }
 
-func call(ws *wsConn, id, method string, payload json.RawMessage) error {
+// inSession runs fn on a connection attached to the session. fn's calls
+// take the method's payload and return its result.
+func inSession(session string, fn func(call func(method string, payload any) (json.RawMessage, error)) error) error {
+	ws, err := dialServer()
+	if err != nil {
+		return err
+	}
+	defer ws.Close()
+	n := 0
+	do := func(method string, payload any) (json.RawMessage, error) {
+		n++
+		b, _ := json.Marshal(payload)
+		out, err := call(ws, fmt.Sprintf("bowser-%d", n), method, b)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", method, err)
+		}
+		return out, nil
+	}
+	if _, err := do("session.attach", map[string]string{"session_id": session}); err != nil {
+		return err
+	}
+	return fn(do)
+}
+
+func call(ws *wsConn, id, method string, payload json.RawMessage) (json.RawMessage, error) {
 	b, _ := json.Marshal(message{Type: "request", ID: id, Method: method, Payload: payload})
 	if err := ws.WriteText(b); err != nil {
-		return err
+		return nil, err
 	}
 	ws.conn.SetReadDeadline(time.Now().Add(rexCallTimeout))
 	defer ws.conn.SetReadDeadline(time.Time{})
 	for {
 		raw, err := ws.ReadMessage()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		var m message
 		if json.Unmarshal(raw, &m) != nil || m.Type != "response" || m.ID != id {
 			continue // events
 		}
 		if m.Error != nil {
-			return m.Error
+			return nil, m.Error
 		}
-		return nil
+		return m.Payload, nil
 	}
 }
 

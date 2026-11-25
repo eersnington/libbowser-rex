@@ -80,7 +80,8 @@ func startEngine(onEvent func(*engine, engineEvent)) (*engine, error) {
 	ready := make(chan struct{})
 	go func() {
 		sc := bufio.NewScanner(stdout)
-		sc.Buffer(make([]byte, 64<<10), 1<<20)
+		// A cdp reply can be a screenshot or a whole page's tree.
+		sc.Buffer(make([]byte, 64<<10), 256<<20)
 		started := false
 		for sc.Scan() {
 			var ev engineEvent

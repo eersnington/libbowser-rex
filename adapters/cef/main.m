@@ -43,6 +43,7 @@
 #include "include/capi/cef_command_line_capi.h"
 #include "include/capi/cef_trace_capi.h"
 #include "include/capi/cef_context_menu_handler_capi.h"
+#include "include/capi/cef_devtools_message_observer_capi.h"
 #include "include/capi/cef_dialog_handler_capi.h"
 #include "include/capi/cef_display_handler_capi.h"
 #include "include/capi/cef_find_handler_capi.h"
@@ -124,6 +125,8 @@ static struct {
   NSMutableDictionary<NSNumber *, id> *menus; // open menus by id
   int nextMenu;
   NSString *tracePath; // trace_stop's destination while CEF writes it
+  NSMutableDictionary<NSNumber *, id> *cdpCalls; // DevTools message id → the command's id
+  int nextCdp;
 } E;
 
 bool engine_log_enabled(void) {
@@ -1316,6 +1319,8 @@ static void CEF_CALLBACK on_before_close(cef_life_span_handler_t *self, cef_brow
   Tab *t = tab_of(browser);
   unref(browser);
   if (!t) return;
+  unref(t->devtools); // results still on their way are lost; their callers time out
+  t->devtools = NULL;
   unref(t->host);
   unref(t->browser);
   t->host = NULL;
@@ -1336,31 +1341,44 @@ static void CEF_CALLBACK on_before_close(cef_life_span_handler_t *self, cef_brow
 // (see Menus); the rest is suppressed until the vocabulary can hand it over.
 // windowed.m also keeps every window and menu of this process off screen.
 
-// Links that target a new window (target=_blank, window.open) open in this
-// tab instead: the host owns tabs, and there is no message for "new tab" yet.
+// Links that target a new window (target=_blank, window.open): the host owns
+// panes, so a controller gets a popup event and opens one. Without a
+// controller, the page loads in this tab. Chromium's popup blocker keeps a
+// page from opening one on its own, without a click or a key.
+static void open_elsewhere(Tab *t, NSString *url, bool foreground) {
+  emit(@{@"event" : @"popup", @"surface" : t->sid, @"url" : url, @"foreground" : @(foreground)});
+}
+
 static int CEF_CALLBACK on_before_popup(cef_life_span_handler_t *self, cef_browser_t *browser, cef_frame_t *frame,
                                         int popup_id, const cef_string_t *url, const cef_string_t *name,
                                         cef_window_open_disposition_t disposition, int gesture,
                                         const cef_popup_features_t *features, cef_window_info_t *wi,
                                         cef_client_t **client, cef_browser_settings_t *settings,
                                         cef_dictionary_value_t **extra, int *no_js_access) {
-  cef_frame_t *main = browser->get_main_frame(browser);
-  main->load_url(main, url);
-  unref(main);
+  Tab *t = tab_of(browser);
+  if (E.control && t) {
+    open_elsewhere(t, ns_str(url), disposition != CEF_WOD_NEW_BACKGROUND_TAB);
+  } else {
+    cef_frame_t *main = browser->get_main_frame(browser);
+    main->load_url(main, url);
+    unref(main);
+  }
   unref(frame);
   unref(browser);
   return 1;
 }
 
 // Context menus: CEF's model, trimmed to what works without a window of our
-// own, plus the link items a browser has.
-enum { kOpenLink = MENU_ID_USER_FIRST, kCopyLink };
+// own, plus the link items a browser has. With a controller: links open in
+// a new pane, and Send to Agent hands what was clicked to the agent beside
+// this pane (the controller finds it).
+enum { kOpenLink = MENU_ID_USER_FIRST, kCopyLink, kOpenLinkPane, kSendToAgent };
 
 static bool kept_command(int command) {
   return (command >= MENU_ID_BACK && command <= MENU_ID_STOPLOAD) ||
          (command >= MENU_ID_UNDO && command <= MENU_ID_SELECT_ALL) ||
          (command >= MENU_ID_SPELLCHECK_SUGGESTION_0 && command <= MENU_ID_ADD_TO_DICTIONARY) ||
-         command == kOpenLink || command == kCopyLink;
+         (command >= kOpenLink && command <= kSendToAgent);
 }
 
 static void CEF_CALLBACK on_before_context_menu(cef_context_menu_handler_t *self, cef_browser_t *browser,
@@ -1379,14 +1397,23 @@ static void CEF_CALLBACK on_before_context_menu(cef_context_menu_handler_t *self
   }
   cef_string_userfree_t link = params->get_link_url(params);
   if (link && link->length) {
-    cef_string_t open = cef_str("Open Link"), copy = cef_str("Copy Link Address");
+    cef_string_t open = cef_str("Open Link"), pane = cef_str("Open Link in New Pane"),
+                 copy = cef_str("Copy Link Address");
     model->insert_separator_at(model, 0);
     model->insert_item_at(model, 0, kCopyLink, &copy);
+    if (E.control) model->insert_item_at(model, 0, kOpenLinkPane, &pane);
     model->insert_item_at(model, 0, kOpenLink, &open);
     cef_string_clear(&open);
+    cef_string_clear(&pane);
     cef_string_clear(&copy);
   }
   if (link) cef_string_userfree_free(link);
+  if (E.control) {
+    cef_string_t send = cef_str("Send to Agent");
+    model->add_separator(model);
+    model->add_item(model, kSendToAgent, &send);
+    cef_string_clear(&send);
+  }
   // No separator first, last, or after another.
   for (size_t i = model->get_count(model); i-- > 0;) {
     if (model->get_type_at(model, i) != MENUITEMTYPE_SEPARATOR) continue;
@@ -1471,12 +1498,22 @@ static int CEF_CALLBACK on_context_menu_command(cef_context_menu_handler_t *self
     cef_string_userfree_t link = params->get_link_url(params);
     NSString *url = ns_str(link);
     if (link) cef_string_userfree_free(link);
-    // In this tab, like target=_blank (see on_before_popup).
     if (command == kOpenLink && t && t->browser) load(t, url);
     if (command == kCopyLink) {
       [NSPasteboard.generalPasteboard clearContents];
       [NSPasteboard.generalPasteboard setString:url forType:NSPasteboardTypeString];
     }
+    handled = 1;
+  } else if (command == kOpenLinkPane && t) {
+    cef_string_userfree_t link = params->get_link_url(params);
+    open_elsewhere(t, ns_str(link), true);
+    if (link) cef_string_userfree_free(link);
+    handled = 1;
+  } else if (command == kSendToAgent && t) {
+    cef_string_userfree_t sel = params->get_selection_text(params);
+    emit(@{@"event" : @"send_to_agent", @"surface" : t->sid, @"x" : @(params->get_xcoord(params)),
+           @"y" : @(params->get_ycoord(params)), @"selection" : ns_str(sel) ?: @""});
+    if (sel) cef_string_userfree_free(sel);
     handled = 1;
   }
   unref(params);
@@ -1617,6 +1654,87 @@ static bool default_windowed(bowser_transport_e transport) {
   return transport == BOWSER_TRANSPORT_CALAYERHOST && !E.osrOnly;
 }
 
+// ---- DevTools protocol ------------------------------------------------
+// The cdp command runs one DevTools protocol method in a tab, in process,
+// with no debugging port: only our controller can drive the page. The reply
+// comes when Chromium answers, after other commands have had theirs.
+
+static void write_line(NSData *d) {
+  if (!E.control) return;
+  fwrite(d.bytes, 1, d.length, stdout);
+  fputc('\n', stdout);
+  fflush(stdout);
+}
+
+static void CEF_CALLBACK on_cdp_result(cef_dev_tools_message_observer_t *self, cef_browser_t *browser, int message_id,
+                                       int success, const void *result, size_t size) {
+  unref(browser);
+  NSNumber *key = @(message_id);
+  id cmdId = E.cdpCalls[key];
+  if (!cmdId) return; // a method someone else sent
+  [E.cdpCalls removeObjectForKey:key];
+  NSData *body = result ? [NSData dataWithBytes:result length:size] : [@"{}" dataUsingEncoding:NSUTF8StringEncoding];
+  if (!success) {
+    NSDictionary *err = [NSJSONSerialization JSONObjectWithData:body options:0 error:nil];
+    id message = [err isKindOfClass:NSDictionary.class] ? err[@"message"] : nil;
+    emit(@{@"id" : cmdId, @"error" : [message isKindOfClass:NSString.class] ? message : @"the method failed"});
+    return;
+  }
+  // Results can be megabytes (a screenshot, a page's tree): pass them on as
+  // they are, without parsing them.
+  NSMutableData *line = [[NSJSONSerialization dataWithJSONObject:@{@"id" : cmdId} options:0 error:nil] mutableCopy];
+  line.length -= 1; // the closing brace
+  [line appendBytes:",\"result\":" length:10];
+  [line appendData:body];
+  [line appendBytes:"}" length:1];
+  write_line(line);
+}
+
+static int CEF_CALLBACK on_cdp_message(cef_dev_tools_message_observer_t *self, cef_browser_t *browser,
+                                       const void *message, size_t size) {
+  unref(browser);
+  return 0; // results go on to on_cdp_result; events are dropped
+}
+
+static void CEF_CALLBACK on_cdp_event(cef_dev_tools_message_observer_t *self, cef_browser_t *browser,
+                                      const cef_string_t *method, const void *params, size_t size) {
+  unref(browser);
+}
+
+static void CEF_CALLBACK on_cdp_attach(cef_dev_tools_message_observer_t *self, cef_browser_t *browser) {
+  unref(browser);
+}
+
+static cef_dev_tools_message_observer_t cdp_observer = {
+    STATIC_BASE(cef_dev_tools_message_observer_t),
+    .on_dev_tools_message = on_cdp_message,
+    .on_dev_tools_method_result = on_cdp_result,
+    .on_dev_tools_event = on_cdp_event,
+    .on_dev_tools_agent_attached = on_cdp_attach,
+    .on_dev_tools_agent_detached = on_cdp_attach,
+};
+
+// Sends the method; nil means the reply comes later, from on_cdp_result.
+static NSDictionary *cdp_command(Tab *t, NSDictionary *cmd) {
+  id method = cmd[@"method"], params = cmd[@"params"] ?: @{};
+  if (![method isKindOfClass:NSString.class] || ![params isKindOfClass:NSDictionary.class])
+    return @{@"error" : @"cdp needs a method and, optionally, params as an object"};
+  if (!t->host) return @{@"error" : @"the page isn't ready yet"};
+  if (!cmd[@"id"]) return @{@"error" : @"cdp needs an id to answer"};
+  if (!t->devtools) t->devtools = t->host->add_dev_tools_message_observer(t->host, &cdp_observer);
+  int mid = ++E.nextCdp;
+  NSData *msg = [NSJSONSerialization dataWithJSONObject:@{@"id" : @(mid), @"method" : method, @"params" : params}
+                                                options:0
+                                                  error:nil];
+  if (!E.cdpCalls) E.cdpCalls = [NSMutableDictionary new];
+  E.cdpCalls[@(mid)] = cmd[@"id"];
+  if (!t->host->send_dev_tools_message(t->host, msg.bytes, msg.length)) {
+    [E.cdpCalls removeObjectForKey:@(mid)];
+    return @{@"error" : @"Chromium refused the message"};
+  }
+  return nil;
+}
+
 // ---- Tracing ----------------------------------------------------------
 // Chromium's own trace of every process, for finding where a frame was late.
 // CEF writes it to a temporary name; the rename marks it complete.
@@ -1707,6 +1825,7 @@ static NSDictionary *run_command(NSDictionary *cmd) {
     close_tab(t);
     return @{};
   }
+  if ([name isEqualToString:@"cdp"]) return cdp_command(t, cmd);
   if ([name isEqualToString:@"message"]) {
     id message = cmd[@"name"], body = cmd[@"body"];
     if (![message isKindOfClass:NSString.class]) return @{@"error" : @"message needs a name"};
@@ -1724,7 +1843,9 @@ static void run_line(NSData *line) {
     emit(@{@"error" : @"not a JSON object"});
     return;
   }
-  NSMutableDictionary *reply = [run_command(cmd) mutableCopy];
+  NSDictionary *answer = run_command(cmd);
+  if (!answer) return; // it answers later
+  NSMutableDictionary *reply = [answer mutableCopy];
   if (cmd[@"id"]) reply[@"id"] = cmd[@"id"];
   emit(reply);
 }

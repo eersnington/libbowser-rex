@@ -124,7 +124,9 @@ paint callback; CPU is `ps` CPU time over the scroll, as % of one core.
 - A connection that sends HELLO but never READY holds a socket until it closes. The uid check limits this to the producer's own user.
 - `bowser_host_attach` blocks the calling thread for up to 3 s when the producer is stopped or busy.
 - Moving test windows to a Space uses private CGS calls (`BOWSER_SPACE`).
-- CEF: menus, JS dialogs, and file pickers are suppressed; new windows open in the same tab. The vocabulary has no way to hand them to the host yet.
+- CEF: JS dialogs and file pickers are suppressed. The vocabulary has no way to hand them to the host yet.
+- New windows open as Rex panes, without `window.opener`: sign-in flows that talk back to the page that opened them don't finish.
+- Send to Agent is tested from the menu to the engine's event; the paste into the agent pane is checked only by hand.
 - CEF: a renderer crash leaves the tab blank, with no event. It needs a `crashed` state and a reload.
 - CEF: a hidden tab (no host) can report `loading: true` long after its page finished; Chromium throttles hidden pages.
 - CEF: the host's screen position isn't in the ABI, so CEF gets view coordinates as screen coordinates.
