@@ -46,9 +46,16 @@ func main() {
 
 	p := newPlugin()
 	go p.warm()
-	if path := os.Getenv("BOWSER_TICKET_SOCKET"); path != "" {
-		go p.serveTickets(path)
+	// Rex starts its own server's plugins with no environment of ours, so the
+	// socket has a fixed home; the client finds it there too (daily.sh).
+	tickets := os.Getenv("BOWSER_TICKET_SOCKET")
+	if tickets == "" {
+		home, _ := os.UserHomeDir()
+		dir := filepath.Join(home, "Library/Application Support/libbowser")
+		os.MkdirAll(dir, 0o700)
+		tickets = filepath.Join(dir, "tickets.sock")
 	}
+	go p.serveTickets(tickets)
 	cleanup := func() {
 		p.closeAll()
 		os.RemoveAll(dir)

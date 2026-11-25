@@ -38,7 +38,7 @@ build() {
 
 make_app() {
   [ -d "$app" ] && return
-  cp -R "/Applications/Rex Beta.app" "$app"
+  cp -R "/Applications/Rex.app" "$app"
   plist="$app/Contents/Info.plist"
   plutil -replace CFBundleIdentifier -string com.superlogical.rex.bowserdev "$plist"
   plutil -replace CFBundleName -string "Rex Bowser Dev" "$plist"
